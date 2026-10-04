@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write # needed to attach files to a release when a v* tag is pushed
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build (also runs the Steinberg VST3 validator)
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "SpeexNoiseSuppression-${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}-win64"
+          New-Item -ItemType Directory pack | Out-Null
+          Copy-Item build/VST3/Release/SpeexNoiseSuppression.vst3 pack -Recurse
+          Copy-Item LICENSE, README.md pack
+          Copy-Item THIRD_PARTY_LICENSES pack -Recurse
+          Compress-Archive -Path pack/* -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File SHA256SUMS.txt -Encoding ascii
+          "ZIP_NAME=$name.zip" | Out-File $env:GITHUB_ENV -Append -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpeexNoiseSuppression-win64
+          path: |
+            ${{ env.ZIP_NAME }}
+            SHA256SUMS.txt
+
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes
+          }
+          gh release upload "${{ github.ref_name }}" "$env:ZIP_NAME" SHA256SUMS.txt --clobber

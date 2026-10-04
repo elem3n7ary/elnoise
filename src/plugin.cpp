@@ -45,7 +45,7 @@ using Microsoft::WRL::ComPtr;
 
 static const FUID kPluginUID (0x5A3C1E70, 0x9B2F4D18, 0xA6C47D02, 0x3E8B5F91);
 
-enum : ParamID { kSuppression = 100 };
+enum : ParamID { kBypass = 99, kSuppression = 100 };
 static constexpr double kMinDb = -60.0;
 static constexpr double kMaxDb = 0.0;
 static constexpr double kDefaultDb = -30.0; // OBS default
@@ -176,8 +176,8 @@ private:
 class SpeexView : public CPluginView
 {
 public:
-	SpeexView (EditController* c, std::atomic<double>* db, Analyzer* in, Analyzer* out)
-	: CPluginView (nullptr), ctrl (c), dbValue (db), aIn (in), aOut (out)
+	SpeexView (EditController* c, std::atomic<double>* db, std::atomic<bool>* bp, Analyzer* in, Analyzer* out)
+	: CPluginView (nullptr), ctrl (c), dbValue (db), byp (bp), aIn (in), aOut (out)
 	{
 		rect = ViewRect (0, 0, kW, kH);
 		for (int b = 0; b < Analyzer::kBands; ++b)
@@ -319,6 +319,21 @@ private:
 	bool hitLcd (int x, int y) const
 	{
 		return x >= kLcdX && x <= kLcdX + kLcdW && y >= kLcdY && y <= kLcdY + kLcdH;
+	}
+
+	static constexpr float kBypX = 288.f, kBypY = 301.f, kBypW = 100.f, kBypH = 26.f;
+	bool hitBypass (int x, int y) const
+	{
+		return x >= kBypX && x <= kBypX + kBypW && y >= kBypY && y <= kBypY + kBypH;
+	}
+	void toggleBypass ()
+	{
+		double nv = byp->load () ? 0.0 : 1.0;
+		ctrl->beginEdit (kBypass);
+		ctrl->setParamNormalized (kBypass, nv);
+		ctrl->performEdit (kBypass, nv);
+		ctrl->endEdit (kBypass);
+		dirty = true;
 	}
 
 	// --- inline numeric entry in the LCD box
@@ -709,6 +724,20 @@ private:
 
 	void drawSliderDynamic ()
 	{
+		// bypass pill
+		{
+			bool on = byp->load ();
+			if (on)
+				rt->FillRoundedRectangle (RR (kBypX, kBypY, kBypW, kBypH, kBypH / 2), vgrad (gPill, kBypY, kBypY + kBypH));
+			else
+				fillRR (kBypX, kBypY, kBypW, kBypH, kBypH / 2, C (22, 22, 24));
+			strokeRR (kBypX + 0.5f, kBypY + 0.5f, kBypW - 1, kBypH - 1, kBypH / 2 - 0.5f,
+			          on ? C (255, 255, 255, 90) : C (84, 84, 90, 170));
+			solid->SetColor (on ? C (24, 24, 26) : C (96, 96, 102));
+			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (kBypX + 15, kBypY + kBypH / 2), 3.5f, 3.5f), solid.Get ());
+			text (L"BYPASS", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, on ? C (24, 24, 26) : cMuted, kBypX + 58, kBypY + 6.5f, kCenter, 1.5f);
+		}
+
 		const float bx = kLcdX, by = kLcdY, bw = kLcdW;
 		double t = curNorm ();
 		wchar_t b[16];
@@ -764,7 +793,7 @@ private:
 		strokeRR (kW / 2.f - 34, 96, 68, 68, 16, C (205, 205, 210), 3.f);
 		text (L"el", 38, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (225, 225, 230), kW / 2.f, 107, kCenter);
 		text (L"Speex Noise Suppression", 24, DWRITE_FONT_WEIGHT_SEMI_BOLD, cWhite, kW / 2.f, 186, kCenter, 0.6f);
-		text (L"VST3  |  version 1.0.0", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, kW / 2.f, 222, kCenter, 0.4f);
+		text (L"VST3  |  version 1.1.0", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, kW / 2.f, 222, kCenter, 0.4f);
 		line (kW / 2.f - 60, 262.5f, kW / 2.f + 60, 262.5f, C (255, 255, 255, 40));
 		text (L"MADE BY", 11, DWRITE_FONT_WEIGHT_SEMI_BOLD, cMuted, kW / 2.f, 282, kCenter, 2.5f);
 		text (L"elem3n7ary", 32, DWRITE_FONT_WEIGHT_SEMI_BOLD, cWhite, kW / 2.f, 300, kCenter, 0.5f);
@@ -924,6 +953,11 @@ private:
 						self->startEdit ();
 					return 0;
 				}
+				if (self->tab == 0 && self->hitBypass (x, y))
+				{
+					self->toggleBypass ();
+					return 0;
+				}
 				int t = self->hitTab (x, y);
 				if (t >= 0)
 				{
@@ -1007,6 +1041,8 @@ private:
 				ScreenToClient (h, &pt);
 				bool hand = self && (self->hitTab (pt.x, pt.y) >= 0 || (self->tab == 0 && (self->dragging || self->onSlider (pt.x, pt.y))));
 				bool ibeam = self && self->tab == 0 && self->hitLcd (pt.x, pt.y);
+				if (self && self->tab == 0 && self->hitBypass (pt.x, pt.y))
+					hand = true;
 				SetCursor (LoadCursor (nullptr, ibeam ? IDC_IBEAM : (hand ? IDC_HAND : IDC_ARROW)));
 				return TRUE;
 			}
@@ -1036,6 +1072,7 @@ private:
 
 	EditController* ctrl;
 	std::atomic<double>* dbValue;
+	std::atomic<bool>* byp;
 	Analyzer *aIn, *aOut;
 	HWND hwnd = nullptr;
 	std::thread ticker;
@@ -1071,7 +1108,7 @@ public:
 	IPlugView* PLUGIN_API createView (FIDString name) SMTG_OVERRIDE
 	{
 		if (FIDStringsEqual (name, ViewType::kEditor))
-			return new SpeexView (this, &suppressDb, &inAnalyzer, &outAnalyzer);
+			return new SpeexView (this, &suppressDb, &bypassed, &inAnalyzer, &outAnalyzer);
 		return nullptr;
 	}
 
@@ -1088,6 +1125,8 @@ public:
 		                              kDefaultDb, 0, ParameterInfo::kCanAutomate);
 		p->setPrecision (0);
 		parameters.addParameter (p);
+		parameters.addParameter (new Parameter (STR16 ("Bypass"), kBypass, nullptr, 0., 1,
+		                                        ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass));
 		return kResultOk;
 	}
 
@@ -1144,12 +1183,19 @@ public:
 			for (int32 i = 0; i < n; ++i)
 			{
 				IParamValueQueue* q = data.inputParameterChanges->getParameterData (i);
-				if (q && q->getParameterId () == kSuppression)
+				if (!q)
+					continue;
+				ParamValue v;
+				int32 off;
+				if (q->getParameterId () == kSuppression)
 				{
-					ParamValue v;
-					int32 off;
 					if (q->getPoint (q->getPointCount () - 1, off, v) == kResultTrue)
 						setNormalized (v);
+				}
+				else if (q->getParameterId () == kBypass)
+				{
+					if (q->getPoint (q->getPointCount () - 1, off, v) == kResultTrue)
+						setParamNormalized (kBypass, v);
 				}
 			}
 		}
@@ -1163,6 +1209,7 @@ public:
 		if (states.empty () || chans > static_cast<int32> (states.size ()))
 			createStates (chans);
 
+		const float bypassTarget = bypassed.load () ? 1.f : 0.f;
 		int level = static_cast<int> (std::lround (suppressDb.load ()));
 		for (int32 c = 0; c < chans; ++c)
 		{
@@ -1178,7 +1225,11 @@ public:
 			{
 				float x = std::clamp (src[i], -1.f, 1.f);
 				ch.inQ[ch.fill] = static_cast<spx_int16_t> (std::lround (x * 32767.f));
-				dst[i] = ch.outQ[ch.fill] * (1.f / 32768.f);
+				float voice = ch.outQ[ch.fill] * (1.f / 32768.f);
+				float dry = ch.dry[ch.fill]; // input delayed by the same 10 ms, so bypass keeps the latency
+				ch.dry[ch.fill] = x;
+				ch.gb += (bypassTarget - ch.gb) * 0.01f; // short crossfade, no clicks
+				dst[i] = voice + (dry - voice) * ch.gb;
 				if (c == 0)
 				{
 					inAnalyzer.push (x);
@@ -1202,6 +1253,9 @@ public:
 		if (!r.readDouble (db))
 			return kResultFalse;
 		setNormalized ((std::clamp (db, kMinDb, kMaxDb) - kMinDb) / (kMaxDb - kMinDb));
+		int32 b;
+		if (r.readInt32 (b))
+			setParamNormalized (kBypass, b ? 1.0 : 0.0);
 		return kResultOk;
 	}
 
@@ -1209,6 +1263,7 @@ public:
 	{
 		IBStreamer w (s, kLittleEndian);
 		w.writeDouble (suppressDb.load ());
+		w.writeInt32 (bypassed.load () ? 1 : 0);
 		return kResultOk;
 	}
 
@@ -1216,6 +1271,8 @@ public:
 	{
 		if (id == kSuppression)
 			suppressDb = kMinDb + v * (kMaxDb - kMinDb);
+		else if (id == kBypass)
+			bypassed = v > 0.5;
 		return SingleComponentEffect::setParamNormalized (id, v);
 	}
 
@@ -1224,6 +1281,8 @@ private:
 	{
 		SpeexPreprocessState* st = nullptr;
 		std::vector<spx_int16_t> inQ, outQ;
+		std::vector<float> dry;
+		float gb = 0.f;
 		int fill = 0;
 		int appliedLevel = 1;
 	};
@@ -1242,13 +1301,14 @@ private:
 		for (auto& ch : states)
 		{
 			ch.st = speex_preprocess_state_init (frame, static_cast<spx_int32_t> (sampleRate));
-			spx_int32_t on = 1, off = 0;
+			spx_int32_t on = 1, off = 0; // VAD is off by default
 			speex_preprocess_ctl (ch.st, SPEEX_PREPROCESS_SET_DENOISE, &on);
 			speex_preprocess_ctl (ch.st, SPEEX_PREPROCESS_SET_AGC, &off);
-			speex_preprocess_ctl (ch.st, SPEEX_PREPROCESS_SET_VAD, &off);
 			speex_preprocess_ctl (ch.st, SPEEX_PREPROCESS_SET_DEREVERB, &off);
 			ch.inQ.assign (frame, 0);
 			ch.outQ.assign (frame, 0);
+			ch.dry.assign (frame, 0.f);
+			ch.gb = bypassed.load () ? 1.f : 0.f;
 		}
 	}
 
@@ -1263,13 +1323,14 @@ private:
 	Analyzer inAnalyzer, outAnalyzer;
 	std::vector<Chan> states;
 	std::atomic<double> suppressDb {kDefaultDb};
+	std::atomic<bool> bypassed {false};
 	double sampleRate = 48000.0;
 	int frame = 480;
 };
 
 BEGIN_FACTORY_DEF ("Speex NS", "", "")
 	DEF_CLASS2 (INLINE_UID_FROM_FUID (kPluginUID), PClassInfo::kManyInstances, kVstAudioEffectClass,
-	            "Speex Noise Suppression", Vst::kSimpleModeSupported, Vst::PlugType::kFxRestoration, "1.0.0",
+	            "Speex Noise Suppression", Vst::kSimpleModeSupported, Vst::PlugType::kFxRestoration, "1.1.0",
 	            kVstVersionString, SpeexNoiseSuppression::create)
 END_FACTORY
 

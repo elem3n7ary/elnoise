@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(SpeexNoiseSuppression VERSION 1.0.0 LANGUAGES C CXX)
+project(SpeexNoiseSuppression VERSION 1.1.0 LANGUAGES C CXX)
 
 # --- Steinberg VST3 SDK (git submodule, MIT) -----------------------------------------------
 set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES OFF CACHE BOOL "" FORCE)

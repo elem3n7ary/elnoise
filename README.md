@@ -16,6 +16,7 @@ example as a microphone effect in Wave Link, so you get the same clean mic in ca
 - Same algorithm and settings as OBS: Speex denoise, **Suppression Level 0 to -60 dB**
   (default -30), AGC / VAD / dereverb off
 - Mono and stereo, any sample rate (processes in 10 ms frames, like OBS: 10 ms latency)
+- Built-in **Bypass** button (crossfaded, keeps latency steady, also exposed to the host)
 - Live **spectrum analyzer**: input vs. output, with input / output / reduction levels
 - Smooth slider with fine adjust (hold **Shift**), mouse wheel, or click the value and **type it in**
 - GPU-accelerated interface (Direct2D), almost no CPU: the audio part is tiny and the
@@ -29,6 +30,8 @@ example as a microphone effect in Wave Link, so you get the same clean mic in ca
    *Speex Noise Suppression*).
 
 Windows 10/11, 64-bit.
+
+Every release zip comes with a SHA256SUMS.txt, and releases are built by GitHub Actions straight from this source.
 
 ## Build from source
 

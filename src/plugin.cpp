@@ -1713,6 +1713,38 @@ public:
 			}
 			const float* src = in.channelBuffers32[c];
 			float* dst = out.channelBuffers32[c];
+			// Fully bypassed (button, or the host switching the effect off): the output is just the 10 ms delayed
+			// input. Skip the engines and the analyzers completely: no CPU is spent, and the spectrum freezes
+			// instead of dancing, like on a switched-off plugin.
+			if (bypassTarget == 1.f && ch.gb == 1.f)
+			{
+				for (int32 i = 0; i < data.numSamples; ++i)
+				{
+					float x = src[i];
+					if (!std::isfinite (x))
+						x = 0.f;
+					x = std::clamp (x, -1.f, 1.f);
+					ch.inQ[ch.fill] = static_cast<spx_int16_t> (x * 32767.f); // keep the engines' input current
+					ch.inF[ch.fill] = x * 32768.f;
+					dst[i] = ch.dry[ch.fill];
+					ch.dry[ch.fill] = x;
+					if (++ch.fill == frame)
+					{
+						ch.fill = 0;
+						if (!ch.cold) // forget stale engine output so leaving bypass starts clean
+						{
+							ch.cold = true;
+							std::fill (ch.outQ.begin (), ch.outQ.end (), static_cast<spx_int16_t> (0));
+							std::fill (ch.outF.begin (), ch.outF.end (), 0.f);
+							ch.gate = ch.gateTarget = 1.f;
+							ch.hold = 0;
+						}
+					}
+				}
+				ch.warm = 2 * frame; // after bypass is released stay on the dry path until the engines have two warm frames
+				continue;
+			}
+			ch.cold = false;
 			for (int32 i = 0; i < data.numSamples; ++i)
 			{
 				float x = src[i];
@@ -1736,9 +1768,12 @@ public:
 					ch.rng = ch.rng * 1664525u + 1013904223u;
 					voice += (static_cast<float> (r1) - static_cast<float> (ch.rng >> 8)) * (1e-4f / 16777216.f);
 				}
-				ch.gb += (bypassTarget - ch.gb) * 0.01f; // short crossfade, no clicks
-				if (std::fabs (bypassTarget - ch.gb) < 1e-4f)
-					ch.gb = bypassTarget; // settle exactly, so bypass is bit-exact
+				const float gbTarget = (bypassTarget == 1.f || ch.warm > 0) ? 1.f : 0.f;
+				if (ch.warm > 0)
+					--ch.warm;
+				ch.gb += (gbTarget - ch.gb) * 0.01f; // short crossfade, no clicks
+				if (std::fabs (gbTarget - ch.gb) < 1e-4f)
+					ch.gb = gbTarget; // settle exactly, so bypass is bit-exact
 				dst[i] = voice + (dry - voice) * ch.gb;
 				if (c == 0)
 				{
@@ -1834,6 +1869,8 @@ private:
 		SpeexPreprocessState* st = nullptr;
 		DenoiseState *rn = nullptr, *rnL = nullptr;
 		float gate = 1.f, gateTarget = 1.f;
+		bool cold = false;
+		int warm = 0;
 		int hold = 0;
 		std::vector<spx_int16_t> inQ, outQ;
 		std::vector<float> inF, outF, dry;

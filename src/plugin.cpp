@@ -17,6 +17,7 @@
 #include "pluginterfaces/vst/vsttypes.h"
 #include "base/source/fstreamer.h"
 #include "public.sdk/source/common/pluginview.h"
+#include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 
 #define NOMINMAX
 #include <windows.h>
@@ -177,7 +178,7 @@ private:
 
 //------------------------------------------------------------------------
 // Editor. Tabs: Main / About.
-class SpeexView : public CPluginView
+class SpeexView : public CPluginView, public IPlugViewContentScaleSupport
 {
 public:
 	SpeexView (EditController* c, std::atomic<double>* db, std::atomic<bool>* bp, std::atomic<int>* mt,
@@ -186,10 +187,24 @@ public:
 	: CPluginView (nullptr), ctrl (c), dbValue (db), byp (bp), meth (mt), rate (sr), vthr (vt), vgrace (vg), vprob (vp),
 	  aIn (in), aOut (out)
 	{
-		rect = ViewRect (0, 0, kW, kH);
+		rect = ViewRect (0, 0, kW, kH); // logical size; grows with the DPI scale (see applyScale)
 		for (int b = 0; b < Analyzer::kBands; ++b)
 			dIn[b] = dOut[b] = sIn[b] = sOut[b] = rIn[b] = rOut[b] = -120.f;
 		lvIn = lvOut = -120.f;
+	}
+
+	OBJ_METHODS (SpeexView, CPluginView)
+	DEFINE_INTERFACES
+		DEF_INTERFACE (IPlugViewContentScaleSupport)
+	END_DEFINE_INTERFACES (CPluginView)
+	REFCOUNT_METHODS (CPluginView)
+
+	// The host reports its DPI scale (e.g. 1.5 on a 150% monitor): the editor grows and renders sharply.
+	tresult PLUGIN_API setContentScaleFactor (ScaleFactor f) SMTG_OVERRIDE
+	{
+		hostScale = true;
+		applyScale (std::clamp (static_cast<float> (f), 1.f, 4.f), false);
+		return kResultTrue;
 	}
 
 	tresult PLUGIN_API isPlatformTypeSupported (FIDString type) SMTG_OVERRIDE
@@ -208,10 +223,12 @@ public:
 		pickFont ();
 		loadBrandFont ();
 		registerClass ();
-		hwnd = CreateWindowExW (0, kClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, kW,
-		                        kH, static_cast<HWND> (parent), nullptr, GetModuleHandleW (nullptr), this);
+		hwnd = CreateWindowExW (0, kClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, pxW (),
+		                        pxH (), static_cast<HWND> (parent), nullptr, GetModuleHandleW (nullptr), this);
 		if (!hwnd)
 			return kResultFalse;
+		if (!hostScale) // host did not tell us: use the DPI of the window we live in
+			applyScale (dpiScaleOf (static_cast<HWND> (parent)), true);
 		aIn->setEnabled (true);
 		aOut->setEnabled (true);
 		running = true;
@@ -254,14 +271,14 @@ public:
 	tresult PLUGIN_API onSize (ViewRect* r) SMTG_OVERRIDE
 	{
 		if (r && hwnd)
-			SetWindowPos (hwnd, nullptr, 0, 0, r->getWidth (), r->getHeight (), SWP_NOZORDER | SWP_NOMOVE);
+			SetWindowPos (hwnd, nullptr, 0, 0, pxW (), pxH (), SWP_NOZORDER | SWP_NOMOVE); // the editor has a fixed size
 		return kResultOk;
 	}
 
 	tresult PLUGIN_API checkSizeConstraint (ViewRect* r) SMTG_OVERRIDE
 	{
 		if (r)
-			*r = ViewRect (0, 0, kW, kH);
+			*r = ViewRect (0, 0, pxW (), pxH ());
 		return kResultTrue;
 	}
 
@@ -307,6 +324,39 @@ private:
 		wc.hCursor = LoadCursor (nullptr, IDC_ARROW);
 		RegisterClassW (&wc);
 		done = true;
+	}
+
+	//-------------------------------------------------------------- DPI scale
+	int pxW () const { return static_cast<int> (std::lround (kW * scale)); }
+	int pxH () const { return static_cast<int> (std::lround (kH * scale)); }
+
+	static float dpiScaleOf (HWND h)
+	{
+		using Fn = UINT (WINAPI*) (HWND);
+		static Fn fn = reinterpret_cast<Fn> (GetProcAddress (GetModuleHandleW (L"user32.dll"), "GetDpiForWindow"));
+		if (!fn || !h)
+			return 1.f;
+		const UINT dpi = fn (h);
+		return dpi >= 96 ? std::clamp (dpi / 96.f, 1.f, 4.f) : 1.f;
+	}
+
+	void applyScale (float sc, bool notifyHost)
+	{
+		if (std::fabs (sc - scale) < 0.01f)
+			return;
+		scale = sc;
+		rect = ViewRect (0, 0, pxW (), pxH ());
+		if (hwnd)
+		{
+			SetWindowPos (hwnd, nullptr, 0, 0, pxW (), pxH (), SWP_NOZORDER | SWP_NOMOVE);
+			releaseTarget (); // re-created at the new DPI
+			dirty = true;
+		}
+		if (notifyHost && plugFrame)
+		{
+			ViewRect r = rect;
+			plugFrame->resizeView (this, &r);
+		}
 	}
 
 	//-------------------------------------------------------------- value handling
@@ -626,9 +676,9 @@ private:
 		if (rt)
 			return true;
 		D2D1_RENDER_TARGET_PROPERTIES rp = D2D1::RenderTargetProperties ();
-		rp.dpiX = rp.dpiY = 96.f;
+		rp.dpiX = rp.dpiY = 96.f * scale; // drawing stays in logical units, Direct2D scales it
 		if (FAILED (d2d->CreateHwndRenderTarget (
-		        rp, D2D1::HwndRenderTargetProperties (hwnd, D2D1::SizeU (kW, kH), D2D1_PRESENT_OPTIONS_IMMEDIATELY),
+		        rp, D2D1::HwndRenderTargetProperties (hwnd, D2D1::SizeU (pxW (), pxH ()), D2D1_PRESENT_OPTIONS_IMMEDIATELY),
 		        &rt)))
 			return false;
 		rt->CreateSolidColorBrush (cWhite, &solid);
@@ -1325,6 +1375,11 @@ private:
 	{
 		auto* self = reinterpret_cast<SpeexView*> (GetWindowLongPtrW (h, GWLP_USERDATA));
 		int x = static_cast<short> (LOWORD (lp)), y = static_cast<short> (HIWORD (lp));
+		if (self && self->scale != 1.f)
+		{
+			x = static_cast<int> (std::lround (x / self->scale));
+			y = static_cast<int> (std::lround (y / self->scale));
+		}
 		if (m == kTickMsg)
 		{
 			if (self)
@@ -1461,6 +1516,10 @@ private:
 					self->dirty = true;
 				}
 				return 0;
+			case 0x02E3: // WM_DPICHANGED_AFTERPARENT
+				if (self && !self->hostScale)
+					self->applyScale (dpiScaleOf (h), true);
+				return 0;
 			case WM_GETDLGCODE:
 				return DLGC_WANTALLKEYS | DLGC_WANTCHARS;
 			case WM_CHAR:
@@ -1493,6 +1552,11 @@ private:
 				POINT pt;
 				GetCursorPos (&pt);
 				ScreenToClient (h, &pt);
+				if (self && self->scale != 1.f)
+				{
+					pt.x = static_cast<LONG> (std::lround (pt.x / self->scale));
+					pt.y = static_cast<LONG> (std::lround (pt.y / self->scale));
+				}
 				bool hand = self && (self->hitTab (pt.x, pt.y) >= 0 || (self->tab == 0 && (self->dragging || self->onSlider (pt.x, pt.y) || self->onGrace (pt.x, pt.y))));
 				if (self && (self->hitPill (pt.x, pt.y) || (self->menuOpen && (self->hitMenuRow (pt.x, pt.y) == 0 || (self->hitMenuRow (pt.x, pt.y) > 0 && self->rnnoiseOk ())))))
 					hand = true;
@@ -1520,6 +1584,8 @@ private:
 					POINT pt;
 					GetCursorPos (&pt);
 					ScreenToClient (h, &pt);
+					pt.x = static_cast<LONG> (std::lround (pt.x / self->scale));
+					pt.y = static_cast<LONG> (std::lround (pt.y / self->scale));
 					const int tg = self->onGrace (pt.x, pt.y) ? 1 : 0;
 					const double range = tg == 1 ? 50.0 : self->mainRange (); // grace moves in 10 ms steps
 					const double step = (GET_WHEEL_DELTA_WPARAM (wp) / 120.0) / range;
@@ -1549,6 +1615,8 @@ private:
 	bool editing = false, editFresh = false, menuOpen = false;
 	int editTarget = 0;
 	int hoverInfo = -1; // which "i" icon the mouse is over
+	float scale = 1.f; // physical pixels per logical pixel
+	bool hostScale = false; // the host told us the scale through IPlugViewContentScaleSupport
 	int hoverRow = -1, dragTarget = 0; // 0 = main slider, 1 = grace slider
 	float vadShown = 0.f, rVad = 0.f;
 	double lastThr = 1e9, lastGrace = 1e9;

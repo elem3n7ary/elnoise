@@ -22,6 +22,7 @@
 
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/gui/iplugview.h"
+#include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -694,9 +695,42 @@ static void testEditorLifecycle ()
 	check (leakPerCycle < 1.0, "no gross memory growth per editor open (< 1 MB per cycle)", "");
 }
 
+static void testScaling ()
+{
+	printf ("\n[12] editor size and DPI scaling\n");
+	Plugin p;
+	p.create (48000, 2);
+	IPlugView* v = p.ctrl->createView ("editor");
+	check (v != nullptr, "editor view is created", "");
+	ViewRect r {};
+	v->getSize (&r);
+	check (r.getWidth () == 560 && r.getHeight () == 424, "default size is 560 x 424", "(%.0f x %.0f)", r.getWidth (), r.getHeight ());
+	IPlugViewContentScaleSupport* cs = nullptr;
+	check (v->queryInterface (IPlugViewContentScaleSupport::iid, reinterpret_cast<void**> (&cs)) == kResultOk && cs,
+	       "editor supports IPlugViewContentScaleSupport", "");
+	if (cs)
+	{
+		struct Case { float f; int w, h; } cases[] = {{1.25f, 700, 530}, {1.5f, 840, 636}, {2.0f, 1120, 848}, {10.f, 2240, 1696}, {0.5f, 560, 424}};
+		for (auto& c : cases)
+		{
+			cs->setContentScaleFactor (c.f);
+			ViewRect q {};
+			v->getSize (&q);
+			ViewRect t {0, 0, 1, 1};
+			v->checkSizeConstraint (&t);
+			char nm[100];
+			snprintf (nm, sizeof nm, "scale %.2f gives %d x %d (extreme values are clamped to 1x..4x)", c.f, c.w, c.h);
+			check (q.getWidth () == c.w && q.getHeight () == c.h && t.getWidth () == c.w && t.getHeight () == c.h, nm, "(%.0f x %.0f)", q.getWidth (), q.getHeight ());
+		}
+		cs->release ();
+	}
+	v->release ();
+	p.destroy ();
+}
+
 static void testInstancesAndLifecycle ()
 {
-	printf ("\n[12] many instances, activate/deactivate cycles\n");
+	printf ("\n[13] many instances, activate/deactivate cycles\n");
 	std::vector<Plugin> ps (8);
 	bool ok = true;
 	for (auto& p : ps) ok = p.create (48000, 2) && ok;
@@ -795,6 +829,7 @@ int wmain (int argc, wchar_t** argv)
 	testTiming ();
 	testSoak ();
 	testEditorLifecycle ();
+	testScaling ();
 	testInstancesAndLifecycle ();
 
 	printf ("\n==== %d passed, %d failed ====\n", g_pass, g_fail);

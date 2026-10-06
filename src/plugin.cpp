@@ -202,7 +202,7 @@ public:
 		if (!FIDStringsEqual (type, kPlatformTypeHWND))
 			return kResultFalse;
 		if (FAILED (D2D1CreateFactory (D2D1_FACTORY_TYPE_SINGLE_THREADED, IID_PPV_ARGS (&d2d))) ||
-		    FAILED (DWriteCreateFactory (DWRITE_FACTORY_TYPE_SHARED, __uuidof (IDWriteFactory),
+		    FAILED (DWriteCreateFactory (DWRITE_FACTORY_TYPE_ISOLATED, __uuidof (IDWriteFactory),
 		                                 reinterpret_cast<IUnknown**> (dw.GetAddressOf ()))))
 			return kResultFalse;
 		pickFont ();
@@ -283,7 +283,7 @@ private:
 	// RNNoise layout: two identical rows (grace, voice gate), each with a slider and a value box
 	static constexpr float kRnR = 398.f, kRnY1 = 321.f, kRnY2 = 383.f;
 	static constexpr float kRnLcdW = 104.f, kRnLcdX = kW - 28.f - kRnLcdW, kRnLcdH = 42.f;
-	static constexpr float kRnBypW = 104.f, kRnBypH = 28.f, kRnBypX = (kW - 12.f) - 12.f - kRnBypW, kRnBypY = kDispT + 12.f;
+	static constexpr float kRnBypW = 104.f, kRnBypH = 28.f, kRnBypX = (kW - 12.f) - 8.f - kRnBypW, kRnBypY = kDispT + 8.f;
 	static constexpr float kPillX = 180.f, kPillY = 12.f, kPillW = 200.f, kPillH = 34.f;
 	static constexpr float kMethodLabelDy = 12.0f, kMethodValueDy = 8.6f; // tuned so both texts share one center line
 	static constexpr float kMenuX = 166.f, kMenuY = 54.f, kMenuW = 228.f, kRowH = 50.f;
@@ -1715,7 +1715,10 @@ public:
 			float* dst = out.channelBuffers32[c];
 			for (int32 i = 0; i < data.numSamples; ++i)
 			{
-				float x = std::clamp (src[i], -1.f, 1.f);
+				float x = src[i];
+				if (!std::isfinite (x)) // a misbehaving host must never poison the filters
+					x = 0.f;
+				x = std::clamp (x, -1.f, 1.f);
 					ch.inQ[ch.fill] = static_cast<spx_int16_t> (std::lround (x * 32767.f));
 				ch.inF[ch.fill] = x * 32768.f;
 				float dry = ch.dry[ch.fill]; // input delayed by the same 10 ms, so bypass keeps the latency
@@ -1734,6 +1737,8 @@ public:
 					voice += (static_cast<float> (r1) - static_cast<float> (ch.rng >> 8)) * (1e-4f / 16777216.f);
 				}
 				ch.gb += (bypassTarget - ch.gb) * 0.01f; // short crossfade, no clicks
+				if (std::fabs (bypassTarget - ch.gb) < 1e-4f)
+					ch.gb = bypassTarget; // settle exactly, so bypass is bit-exact
 				dst[i] = voice + (dry - voice) * ch.gb;
 				if (c == 0)
 				{

@@ -59,3 +59,9 @@ smtg_add_vst3plugin(elNoise
     external/vst3sdk/public.sdk/source/vst/vstsinglecomponenteffect.cpp)
 target_link_libraries(elNoise PRIVATE sdk speexdsp_pp rnnoise_lib)
 target_compile_features(elNoise PRIVATE cxx_std_17)
+
+# --- host-side test suite (loads the built plugin like a DAW would)
+add_executable(elnoise_tests EXCLUDE_FROM_ALL tests/elnoise_tests.cpp external/vst3sdk/public.sdk/source/common/memorystream.cpp)
+target_link_libraries(elnoise_tests PRIVATE sdk sdk_hosting)
+target_compile_features(elnoise_tests PRIVATE cxx_std_17)
+

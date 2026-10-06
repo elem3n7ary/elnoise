@@ -42,14 +42,18 @@ add_library(rnnoise_lib STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/rnnoise_wrapper.c   # includes denoise.c + the "light" constructor
     ${RNN}/src/rnn.c ${RNN}/src/pitch.c ${RNN}/src/kiss_fft.c ${RNN}/src/celt_lpc.c ${RNN}/src/nnet.c
     ${RNN}/src/nnet_default.c ${RNN}/src/parse_lpcnet_weights.c ${RNN}/src/rnnoise_tables.c
-    ${RNN_GEN}/src/rnnoise_data.c ${RNN_GEN}/src/rnnoise_data_little.c)
+    ${RNN_GEN}/src/rnnoise_data.c ${RNN_GEN}/src/rnnoise_data_little.c
+    # SIMD kernels, picked at run time from the CPU features (plain C is the fallback)
+    ${RNN}/src/x86/x86cpu.c ${RNN}/src/x86/x86_dnn_map.c ${RNN}/src/x86/nnet_sse4_1.c ${RNN}/src/x86/nnet_avx2.c)
+set_source_files_properties(${RNN}/src/x86/nnet_avx2.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 # the little model reuses the same symbol names, so rename them for that one file
 set_source_files_properties(${RNN_GEN}/src/rnnoise_data_little.c PROPERTIES
     COMPILE_DEFINITIONS "rnnoise_arrays=rnnoise_arrays_light;init_rnnoise=init_rnnoise_light")
 target_include_directories(rnnoise_lib
     PUBLIC ${RNN}/include
     PRIVATE ${RNN}/src ${RNN_GEN}/src ${CMAKE_CURRENT_SOURCE_DIR}/gen/rnnoise)
-target_compile_definitions(rnnoise_lib PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(rnnoise_lib PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS
+    RNN_ENABLE_X86_RTCD OPUS_X86_MAY_HAVE_SSE OPUS_X86_MAY_HAVE_SSE2 OPUS_X86_MAY_HAVE_SSE4_1)
 set_target_properties(rnnoise_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # --- the plugin --------------------------------------------------------------------------------

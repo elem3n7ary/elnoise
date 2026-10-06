@@ -750,6 +750,24 @@ int wmain (int argc, wchar_t** argv)
 	g_factory = getFactory ();
 	printf ("elNoise test suite\n");
 
+	if (argc > 4 && std::wstring (argv[2]) == L"dump") // dump <method> <out.f32>: raw output for A/B comparisons between builds
+	{
+		PClassInfo ci;
+		for (int i = 0; i < g_factory->countClasses (); ++i)
+		{
+			g_factory->getClassInfo (i, &ci);
+			if (std::string (ci.category) == "Audio Module Class") memcpy (g_cid, ci.cid, sizeof (TUID));
+		}
+		Plugin p;
+		p.create (48000, 2);
+		p.set (kMethod, mnorm (_wtoi (argv[3])));
+		auto o = run (p, makeSignal (48000 * 8, 48000, 0.003, true), 480);
+		p.destroy ();
+		FILE* f = _wfopen (argv[4], L"wb");
+		fwrite (o[0].data (), sizeof (float), o[0].size (), f);
+		fclose (f);
+		return 0;
+	}
 	if (argc > 2 && std::wstring (argv[2]) == L"gui")
 	{
 		g_cycles = argc > 3 ? _wtoi (argv[3]) : 100;

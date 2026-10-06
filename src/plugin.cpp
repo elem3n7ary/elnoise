@@ -283,7 +283,7 @@ private:
 	// RNNoise layout: two identical rows (grace, voice gate), each with a slider and a value box
 	static constexpr float kRnR = 398.f, kRnY1 = 321.f, kRnY2 = 383.f;
 	static constexpr float kRnLcdW = 104.f, kRnLcdX = kW - 28.f - kRnLcdW, kRnLcdH = 42.f;
-	static constexpr float kRnBypW = 94.f, kRnBypH = 24.f, kRnBypX = kW - 28.f - kRnBypW, kRnBypY = 75.f;
+	static constexpr float kRnBypW = 104.f, kRnBypH = 28.f, kRnBypX = (kW - 12.f) - 12.f - kRnBypW, kRnBypY = kDispT + 12.f;
 	static constexpr float kPillX = 180.f, kPillY = 12.f, kPillW = 200.f, kPillH = 34.f;
 	static constexpr float kMethodLabelDy = 12.0f, kMethodValueDy = 8.6f; // tuned so both texts share one center line
 	static constexpr float kMenuX = 166.f, kMenuY = 54.f, kMenuW = 228.f, kRowH = 50.f;
@@ -415,7 +415,7 @@ private:
 	}
 
 	// "i" icons next to the RNNoise headings: hover shows an explanation. [0] voice gate, [1] grace
-	int infoCount () const { return rnnMode () ? 2 : 0; }
+	int infoCount () const { return rnnMode () ? 2 : 1; }
 	float headWidth (const wchar_t* t) const
 	{
 		DWRITE_TEXT_METRICS m {};
@@ -424,11 +424,19 @@ private:
 	}
 	void infoPos (int i, float& x, float& y) const
 	{
+		if (!rnnMode ()) // Speex: next to the SUPPRESSION heading
+		{
+			x = 28.f + headWidth (L"SUPPRESSION") + 14.f;
+			y = 298.f + 9.4f;
+			return;
+		}
 		x = trL () + headWidth (i == 0 ? L"VOICE GATE" : L"GRACE") + 14.f;
 		y = rowY (i == 0 ? 0 : 1) - 33.f + 9.4f;
 	}
 	const wchar_t* infoText (int i) const
 	{
+		if (!rnnMode ())
+			return L"Maximum noise reduction (Speex). Lower value = stronger. Very quiet noise is removed even at 0 dB.";
 		return i == 0 ? L"Mutes the mic when the model hears no voice (0% = off). Raise it until background noise is cut between words."
 		              : L"How long the gate stays open after the voice stops, so word endings are not cut.";
 	}
@@ -1025,6 +1033,19 @@ private:
 			line (right + 2, by + 9, right + 2, by + bh - 9, cWhite, 1.5f);
 	}
 
+	void drawInfoIcons ()
+	{
+		for (int i = 0; i < infoCount (); ++i)
+		{
+			float ix, iy;
+			infoPos (i, ix, iy);
+			const bool h = hoverInfo == i;
+			solid->SetColor (h ? cWhite : C (130, 130, 136));
+			cur->DrawEllipse (D2D1::Ellipse (D2D1::Point2F (ix, iy), 7.f, 7.f), solid.Get (), 1.3f);
+			text (L"i", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, h ? cWhite : C (150, 150, 156), ix, iy - 6.3f, kCenter);
+		}
+	}
+
 	void drawSliderDynamic ()
 	{
 		const bool rn = rnnMode ();
@@ -1039,9 +1060,9 @@ private:
 				fillRR (px, py, pw, ph, ph / 2, C (22, 22, 24));
 			strokeRR (px + 0.5f, py + 0.5f, pw - 1, ph - 1, ph / 2 - 0.5f, on ? C (255, 255, 255, 90) : C (84, 84, 90, 170));
 			solid->SetColor (on ? C (24, 24, 26) : C (96, 96, 102));
-			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (px + (rn ? 14.f : 15.f), py + ph / 2), rn ? 3.2f : 3.5f, rn ? 3.2f : 3.5f), solid.Get ());
-			text (L"BYPASS", rn ? 9 : 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, on ? C (24, 24, 26) : cMuted, px + (rn ? 54.f : 58.f),
-			      py + (rn ? 5.2f : 6.5f), kCenter, rn ? 1.4f : 1.5f);
+			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (px + (rn ? 17.f : 15.f), py + ph / 2), rn ? 3.7f : 3.5f, rn ? 3.7f : 3.5f), solid.Get ());
+			text (L"BYPASS", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, on ? C (24, 24, 26) : cMuted, px + 58.f,
+			      py + (rn ? 7.2f : 6.5f), kCenter, 1.5f);
 		}
 
 		drawLcdContent (0);
@@ -1065,6 +1086,7 @@ private:
 				line (x, kTrackY + 16.f, x, kTrackY + (major ? 26.f : 21.f), lit ? C (220, 220, 225) : cDim);
 			}
 			drawCapsule (kx, kTrackY, 22.f, 40.f, (dragging && dragTarget == 0) || hoverSlider, 3, 4.f);
+			drawInfoIcons ();
 			return;
 		}
 
@@ -1107,16 +1129,7 @@ private:
 			drawCapsule (kx, ry, 18.f, 34.f, dragging && dragTarget == tg ? true : (tg == 0 && hoverSlider), 3);
 		}
 
-		// "i" icons
-		for (int i = 0; i < infoCount (); ++i)
-		{
-			float ix, iy;
-			infoPos (i, ix, iy);
-			const bool h = hoverInfo == i;
-			solid->SetColor (h ? cWhite : C (130, 130, 136));
-			cur->DrawEllipse (D2D1::Ellipse (D2D1::Point2F (ix, iy), 7.f, 7.f), solid.Get (), 1.3f);
-			text (L"i", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, h ? cWhite : C (150, 150, 156), ix, iy - 6.3f, kCenter);
-		}
+		drawInfoIcons ();
 	}
 
 	void drawAbout ()

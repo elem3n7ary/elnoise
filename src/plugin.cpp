@@ -276,12 +276,18 @@ private:
 	static constexpr float kDispT = 70.f, kDispB = 272.f;
 	static constexpr float kPlotL = 34.f, kPlotR = kW - 34.f, kPlotT = 102.f, kPlotB = 218.f;
 	static constexpr float kDbTop = 0.f, kDbBot = -100.f;
-	static constexpr float kTrackL = 44.f, kTrackR = kW - 44.f, kTrackY = 384.f;
+	// Speex layout: kept exactly as in v1.1 on purpose
+	static constexpr float kTrackL = 44.f, kTrackR = kW - 44.f, kTrackY = 372.f;
+	static constexpr float kLcdX = kW - 156.f, kLcdY = 292.f, kLcdW = 128.f, kLcdH = 46.f;
+	static constexpr float kBypX = 288.f, kBypY = 301.f, kBypW = 100.f, kBypH = 26.f;
+	// RNNoise layout: two identical rows (grace, voice gate), each with a slider and a value box
+	static constexpr float kRnR = 398.f, kRnY1 = 321.f, kRnY2 = 383.f;
+	static constexpr float kRnLcdW = 104.f, kRnLcdX = kW - 28.f - kRnLcdW, kRnLcdH = 42.f;
+	static constexpr float kRnBypW = 94.f, kRnBypH = 24.f, kRnBypX = kW - 28.f - kRnBypW, kRnBypY = 75.f;
 	static constexpr float kPillX = 180.f, kPillY = 12.f, kPillW = 200.f, kPillH = 34.f;
 	static constexpr float kMethodLabelDy = 12.0f, kMethodValueDy = 8.6f; // tuned so both texts share one center line
 	static constexpr float kMenuX = 166.f, kMenuY = 54.f, kMenuW = 228.f, kRowH = 50.f;
-	static constexpr const wchar_t* kMethodNames[3] = {L"SPEEX", L"RNNOISE", L"RNNOISE LITE"};
-	static constexpr float kGrL = 44.f, kGrR = 398.f, kGrY = 319.f, kGrLabelY = 289.f; // grace-period slider (RNNoise modes), next to the number
+	static constexpr const wchar_t* kMethodNames[3] = {L"SPEEX", L"RNNOISE", L"RNNOISE LITE"}; // grace-period slider (RNNoise modes), next to the number
 	static constexpr float kTabX0 = kW - 172.f, kTabMid = kW - 94.f, kTabX1 = kW - 16.f;
 
 	static Clr C (int r, int g, int b, int a = 255) { return D2D1::ColorF (r / 255.f, g / 255.f, b / 255.f, a / 255.f); }
@@ -326,9 +332,28 @@ private:
 	}
 	double mainRange () const { return rnnMode () ? 100.0 : (kMaxDb - kMinDb); }
 
+	// geometry that depends on the engine
+	float trL () const { return kTrackL; }
+	float trR () const { return rnnMode () ? kRnR : kTrackR; }
+	float rowY (int target) const { return rnnMode () ? (target == 1 ? kRnY1 : kRnY2) : kTrackY; }
+	void lcdRect (int target, float& x, float& y, float& w, float& h) const
+	{
+		if (!rnnMode ())
+		{
+			x = kLcdX; y = kLcdY; w = kLcdW; h = kLcdH;
+			return;
+		}
+		x = kRnLcdX; w = kRnLcdW; h = kRnLcdH; y = rowY (target) - h / 2;
+	}
+	void bypassRect (float& x, float& y, float& w, float& h) const
+	{
+		if (rnnMode ()) { x = kRnBypX; y = kRnBypY; w = kRnBypW; h = kRnBypH; }
+		else { x = kBypX; y = kBypY; w = kBypW; h = kBypH; }
+	}
+
 	// While dragging, the view tracks the value locally and only talks to the host when the
 	// rounded value changes (Speex only takes whole dB anyway).
-	void setNorm (double t)
+	void setNorm (double t, int target = 0)
 	{
 		t = std::clamp (t, 0.0, 1.0);
 		dirty = true;
@@ -344,42 +369,66 @@ private:
 			}
 			return;
 		}
-		ctrl->setParamNormalized (mainParam (), t);
-		ctrl->performEdit (mainParam (), t);
+		const ParamID pid = target == 1 ? kVadGrace : mainParam ();
+		ctrl->setParamNormalized (pid, t);
+		ctrl->performEdit (pid, t);
 	}
 
-	// "i" icons next to headings: hover shows an explanation.
-	// Speex: [0] suppression. RNNoise: [0] voice gate, [1] grace period
-	int infoCount () const { return rnnMode () ? 2 : 1; }
-	float headWidth (const wchar_t* t, float size, float track) const
+	bool onSlider (int x, int y) const
+	{
+		const float ry = rowY (0);
+		const bool inY = rnnMode () ? (y >= ry - 22 && y <= ry + 36) : (y >= 330 && y <= 418);
+		return inY && x >= trL () - 20 && x <= trR () + 20;
+	}
+	bool onGrace (int x, int y) const
+	{
+		return rnnMode () && y >= rowY (1) - 22 && y <= rowY (1) + 24 && x >= trL () - 20 && x <= trR () + 20;
+	}
+	int hitLcdIdx (int x, int y) const
+	{
+		if (tab != 0)
+			return -1;
+		for (int t = 0; t < (rnnMode () ? 2 : 1); ++t)
+		{
+			float bx, by, bw, bh;
+			lcdRect (t, bx, by, bw, bh);
+			if (x >= bx && x <= bx + bw && y >= by && y <= by + bh)
+				return t;
+		}
+		return -1;
+	}
+
+	bool hitBypass (int x, int y) const
+	{
+		float bx, by, bw, bh;
+		bypassRect (bx, by, bw, bh);
+		return x >= bx && x <= bx + bw && y >= by && y <= by + bh;
+	}
+	void toggleBypass ()
+	{
+		double nv = byp->load () ? 0.0 : 1.0;
+		ctrl->beginEdit (kBypass);
+		ctrl->setParamNormalized (kBypass, nv);
+		ctrl->performEdit (kBypass, nv);
+		ctrl->endEdit (kBypass);
+		dirty = true;
+	}
+
+	// "i" icons next to the RNNoise headings: hover shows an explanation. [0] voice gate, [1] grace
+	int infoCount () const { return rnnMode () ? 2 : 0; }
+	float headWidth (const wchar_t* t) const
 	{
 		DWRITE_TEXT_METRICS m {};
-		const_cast<SpeexView*> (this)->layoutFor (t, size, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, track)->GetMetrics (&m);
-		return m.widthIncludingTrailingWhitespace - track;
+		const_cast<SpeexView*> (this)->layoutFor (t, 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, 2.2f)->GetMetrics (&m);
+		return m.widthIncludingTrailingWhitespace - 2.2f;
 	}
-	static constexpr float kInfoY = kTrackY - 31.f;
 	void infoPos (int i, float& x, float& y) const
 	{
-		if (!rnnMode ())
-		{
-			x = 28.f + headWidth (L"SUPPRESSION", 13, 2.2f) + 14.f;
-			y = 298.f + 8.5f;
-		}
-		else if (i == 0)
-		{
-			x = kTrackL + headWidth (L"VOICE GATE", 13, 2.2f) + 14.f;
-			y = kInfoY;
-		}
-		else
-		{
-			x = kGrL + headWidth (L"GRACE", 10, 1.4f) + 12.f;
-			y = kGrLabelY + 6.8f;
-		}
+		x = trL () + headWidth (i == 0 ? L"VOICE GATE" : L"GRACE") + 14.f;
+		y = rowY (i == 0 ? 0 : 1) - 33.f + 9.4f;
 	}
 	const wchar_t* infoText (int i) const
 	{
-		if (!rnnMode ())
-			return L"Maximum noise reduction (Speex). Lower value = stronger. Very quiet noise is removed even at 0 dB.";
 		return i == 0 ? L"Mutes the mic when the model hears no voice (0% = off). Raise it until background noise is cut between words."
 		              : L"How long the gate stays open after the voice stops, so word endings are not cut.";
 	}
@@ -397,41 +446,13 @@ private:
 		return -1;
 	}
 
-	bool onSlider (int x, int y) const
-	{
-		return y >= 361 && y <= 420 && x >= kTrackL - 20 && x <= kTrackR + 20;
-	}
-	bool onGrace (int x, int y) const
-	{
-		return rnnMode () && y >= 303 && y <= 337 && x >= kGrL - 10 && x <= kGrR + 10;
-	}
-	static constexpr float kLcdW = 106.f, kLcdX = kW - 28.f - kLcdW, kLcdY = 288.f, kLcdH = 46.f;
-	bool hitLcd (int x, int y) const
-	{
-		return x >= kLcdX && x <= kLcdX + kLcdW && y >= kLcdY && y <= kLcdY + kLcdH;
-	}
-
-	static constexpr float kBypW = 94.f, kBypH = 24.f, kBypX = kW - 28.f - kBypW, kBypY = 75.f; // top-right of the display
-	bool hitBypass (int x, int y) const
-	{
-		return x >= kBypX && x <= kBypX + kBypW && y >= kBypY && y <= kBypY + kBypH;
-	}
-	void toggleBypass ()
-	{
-		double nv = byp->load () ? 0.0 : 1.0;
-		ctrl->beginEdit (kBypass);
-		ctrl->setParamNormalized (kBypass, nv);
-		ctrl->performEdit (kBypass, nv);
-		ctrl->endEdit (kBypass);
-		dirty = true;
-	}
-
-	// --- inline numeric entry in the LCD box
-	void startEdit ()
+	// --- inline numeric entry in a value box
+	void startEdit (int target)
 	{
 		editing = true;
+		editTarget = target;
 		editFresh = true; // first typed character replaces the whole value
-		editBuf = std::to_wstring (quant (0, curNorm ()));
+		editBuf = std::to_wstring (quant (target, normFor (target)));
 		caretT = GetTickCount ();
 		SetFocus (hwnd);
 		dirty = true;
@@ -445,8 +466,11 @@ private:
 		if (editBuf.empty () || editBuf == L"-")
 			return;
 		long v = std::wcstol (editBuf.c_str (), nullptr, 10);
+		const int tg = editTarget;
 		double t;
-		if (rnnMode ())
+		if (tg == 1)
+			t = std::clamp<long> (v, 0, 500) / 500.0; // grace period in ms
+		else if (rnnMode ())
 			t = std::clamp<long> (v, 0, 100) / 100.0; // percent
 		else
 		{
@@ -454,9 +478,10 @@ private:
 				v = -v; // the range is 0..-60, so "30" means -30
 			t = (std::clamp<long> (v, static_cast<long> (kMinDb), static_cast<long> (kMaxDb)) - kMinDb) / (kMaxDb - kMinDb);
 		}
-		ctrl->beginEdit (mainParam ());
-		setNorm (t);
-		ctrl->endEdit (mainParam ());
+		const ParamID pid = tg == 1 ? kVadGrace : mainParam ();
+		ctrl->beginEdit (pid);
+		setNorm (t, tg);
+		ctrl->endEdit (pid);
 	}
 	void cancelEdit ()
 	{
@@ -501,7 +526,7 @@ private:
 
 	bool hitPill (int x, int y) const
 	{
-		return x >= kPillX && x <= kPillX + kPillW && y >= kPillY && y <= kPillY + kPillH;
+		return tab == 0 && x >= kPillX && x <= kPillX + kPillW && y >= kPillY && y <= kPillY + kPillH;
 	}
 	// -1 = none, 0..2 = method row
 	int hitMenuRow (int x, int y) const
@@ -772,23 +797,26 @@ private:
 		text (L"el", 23, DWRITE_FONT_WEIGHT_NORMAL, C (225, 225, 230), 28.3f, 15.0f, kCenter, 0.f, true);
 		text (L"Noise", 26.4f, DWRITE_FONT_WEIGHT_NORMAL, C (240, 240, 243), 47.9f, 12.4f, kLeft, 0.25f, true);
 
-		// method selector (center): click to choose the engine
-		fillRR (kPillX, kPillY, kPillW, kPillH, kPillH / 2, C (20, 20, 22));
-		strokeRR (kPillX + 0.5f, kPillY + 0.5f, kPillW - 1, kPillH - 1, kPillH / 2 - 0.5f, C (84, 84, 90, 170));
-		// label and value on one row (same center line), the pair centered in the pill
+		if (tab == 0) // the engine selector only exists on the Main tab
 		{
-			DWRITE_TEXT_METRICS m1 {}, m2 {};
-			layoutFor (L"METHOD", 8, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, 1.4f)->GetMetrics (&m1);
-			layoutFor (kMethodNames[meth->load ()], 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, 0.9f)->GetMetrics (&m2);
-			const float gap = 12.f, w1 = m1.widthIncludingTrailingWhitespace - 1.4f, w2 = m2.widthIncludingTrailingWhitespace - 0.9f;
-			const float x0 = kPillX + (kPillW - 24.f) / 2.f - (w1 + gap + w2) / 2.f;
-			text (L"METHOD", 8, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (100, 100, 106), x0, kPillY + kMethodLabelDy, kLeft, 1.4f);
-			text (kMethodNames[meth->load ()], 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cWhite, x0 + w1 + gap, kPillY + kMethodValueDy, kLeft, 0.9f);
-		}
-		{
-			const float ax = kPillX + kPillW - 20, ay = kPillY + kPillH / 2;
-			line (ax - 4, ay - 1.5f, ax, ay + 2.5f, cText, 1.6f);
-			line (ax, ay + 2.5f, ax + 4, ay - 1.5f, cText, 1.6f);
+			// method selector (center): click to choose the engine
+			fillRR (kPillX, kPillY, kPillW, kPillH, kPillH / 2, C (20, 20, 22));
+			strokeRR (kPillX + 0.5f, kPillY + 0.5f, kPillW - 1, kPillH - 1, kPillH / 2 - 0.5f, C (84, 84, 90, 170));
+			// label and value on one row (same center line), the pair centered in the pill
+			{
+				DWRITE_TEXT_METRICS m1 {}, m2 {};
+				layoutFor (L"METHOD", 8, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, 1.4f)->GetMetrics (&m1);
+				layoutFor (kMethodNames[meth->load ()], 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, 0.9f)->GetMetrics (&m2);
+				const float gap = 12.f, w1 = m1.widthIncludingTrailingWhitespace - 1.4f, w2 = m2.widthIncludingTrailingWhitespace - 0.9f;
+				const float x0 = kPillX + (kPillW - 24.f) / 2.f - (w1 + gap + w2) / 2.f;
+				text (L"METHOD", 8, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (100, 100, 106), x0, kPillY + kMethodLabelDy, kLeft, 1.4f);
+				text (kMethodNames[meth->load ()], 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cWhite, x0 + w1 + gap, kPillY + kMethodValueDy, kLeft, 0.9f);
+			}
+			{
+				const float ax = kPillX + kPillW - 20, ay = kPillY + kPillH / 2;
+				line (ax - 4, ay - 1.5f, ax, ay + 2.5f, cText, 1.6f);
+				line (ax, ay + 2.5f, ax + 4, ay - 1.5f, cText, 1.6f);
+			}
 		}
 
 		// segmented tabs
@@ -827,6 +855,8 @@ private:
 		text (L"INPUT", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (150, 150, 156), 52, 80, kLeft, 1.2f);
 		line (108, 87, 126, 87, cOut, 1.6f);
 		text (L"OUTPUT", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (225, 225, 230), 132, 80, kLeft, 1.2f);
+		if (!rnnMode ())
+			text (L"SPECTRUM", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (96, 96, 102), kW - 28, 80, kRight, 1.5f);
 
 		// grid
 		const float fmax = std::min (Analyzer::kFMax, 0.45f * 48000.f);
@@ -879,48 +909,64 @@ private:
 		}
 	}
 
-	void drawSlider ()
+	void lcdFrame (float bx, float by, float bw, float bh)
 	{
-		const bool rn = rnnMode ();
-		line (0, 283.5f, kW, 283.5f, C (0, 0, 0, 160));
-		line (0, 284.5f, kW, 284.5f, C (255, 255, 255, 20));
-
-		if (rn) // heading sits right above the slider it belongs to
-			text (L"VOICE GATE", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cText, kTrackL, kTrackY - 40.f, kLeft, 2.2f);
-		else
-		{
-			text (L"SUPPRESSION", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cText, 28, 298, kLeft, 2.2f);
-			text (L"Lower value = stronger noise reduction", 12, DWRITE_FONT_WEIGHT_NORMAL, cMuted, 28, 319, kLeft);
-		}
-
-		// LCD
-		const float bx = kLcdX, by = kLcdY, bw = kLcdW, bh = kLcdH;
 		cur->FillRoundedRectangle (RR (bx, by, bw, bh, 8), vgrad (gLcd, by, by + bh));
 		strokeRR (bx + 0.5f, by + 0.5f, bw - 1, bh - 1, 8, C (0, 0, 0), 1.f);
 		line (bx + 6, by + bh + 1.5f, bx + bw - 6, by + bh + 1.5f, C (255, 255, 255, 24));
 		line (bx + 8, by + 1.5f, bx + bw - 8, by + 1.5f, C (255, 255, 255, 12));
-		if (!rn)
-			text (L"dB", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, bx + bw - 10, by + 21, kRight);
+	}
+	void grooveFrame (float ry, float l, float r)
+	{
+		fillRR (l - 5, ry - 5, r - l + 10, 10, 5, C (6, 6, 7));
+		strokeRR (l - 4.5f, ry - 4.5f, r - l + 9, 9, 4.5f, C (66, 66, 72), 1.f);
+		line (l, ry - 3.5f, r, ry - 3.5f, C (0, 0, 0, 160));
+	}
 
-		// groove
-		fillRR (kTrackL - 5, kTrackY - 5, kTrackR - kTrackL + 10, 10, 5, C (6, 6, 7));
-		strokeRR (kTrackL - 4.5f, kTrackY - 4.5f, kTrackR - kTrackL + 9, 9, 4.5f, C (66, 66, 72), 1.f);
-		line (kTrackL, kTrackY - 3.5f, kTrackR, kTrackY - 3.5f, C (0, 0, 0, 160));
-		const int majors = rn ? 5 : 6;
-		for (int i = 0; i <= majors; ++i)
+	void drawSlider ()
+	{
+		line (0, 283.5f, kW, 283.5f, C (0, 0, 0, 160));
+		line (0, 284.5f, kW, 284.5f, C (255, 255, 255, 20));
+
+		if (!rnnMode ())
 		{
-			float x = std::floor (kTrackL + (kTrackR - kTrackL) * i / float (majors)) + 0.5f;
-			wchar_t lb[8];
-			swprintf (lb, 8, L"%d", rn ? i * 20 : -60 + i * 10);
-			text (lb, 10, DWRITE_FONT_WEIGHT_NORMAL, C (140, 140, 146), x, kTrackY + 23.f, kCenter);
+			// Speex: unchanged from v1.1
+			text (L"SUPPRESSION", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cText, 28, 298, kLeft, 2.2f);
+			text (L"Lower value = stronger noise reduction", 11, DWRITE_FONT_WEIGHT_NORMAL, cMuted, 28, 320, kLeft);
+			lcdFrame (kLcdX, kLcdY, kLcdW, kLcdH);
+			text (L"dB", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, kLcdX + kLcdW - 14, kLcdY + 21, kRight);
+			grooveFrame (kTrackY, kTrackL, kTrackR);
+			for (int i = 0; i <= 30; i += 5)
+			{
+				float x = std::floor (kTrackL + (kTrackR - kTrackL) * i / 30.f) + 0.5f;
+				wchar_t lb[8];
+				swprintf (lb, 8, L"%d", -60 + i * 2);
+				text (lb, 10, DWRITE_FONT_WEIGHT_NORMAL, C (140, 140, 146), x, kTrackY + 28.f, kCenter);
+			}
+			return;
 		}
 
-		if (rn) // grace period
-			text (L"GRACE", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (118, 118, 124), kGrL, kGrLabelY, kLeft, 1.4f);
+		// RNNoise: two identical rows. target 1 = grace period (top), target 0 = voice gate (bottom)
+		for (int tg = 1; tg >= 0; --tg)
+		{
+			const float ry = rowY (tg);
+			text (tg == 1 ? L"GRACE" : L"VOICE GATE", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cText, trL (), ry - 33.f, kLeft, 2.2f);
+			float bx, by, bw, bh;
+			lcdRect (tg, bx, by, bw, bh);
+			lcdFrame (bx, by, bw, bh);
+			grooveFrame (ry, trL (), trR ());
+		}
+		for (int i = 0; i <= 5; ++i) // tick labels under the voice gate slider
+		{
+			float x = std::floor (trL () + (trR () - trL ()) * i / 5.f) + 0.5f;
+			wchar_t lb[8];
+			swprintf (lb, 8, L"%d", i * 20);
+			text (lb, 10, DWRITE_FONT_WEIGHT_NORMAL, C (140, 140, 146), x, rowY (0) + 23.f, kCenter);
+		}
 	}
 
 	// capsule-shaped slider knob (same look for every slider)
-	void drawCapsule (float cx, float cy, float w, float h, bool hot, int grips)
+	void drawCapsule (float cx, float cy, float w, float h, bool hot, int grips, float spacing = 3.5f)
 	{
 		const float r = w * 0.42f;
 		for (int i = 4; i >= 1; --i)
@@ -931,115 +977,134 @@ private:
 		const float gh = h * 0.23f;
 		for (int k = 0; k < grips; ++k)
 		{
-			const float gx = cx + (k - (grips - 1) / 2.f) * 3.5f;
+			const float gx = cx + (k - (grips - 1) / 2.f) * spacing;
 			line (gx, cy - gh, gx, cy + gh, C (58, 58, 64), 1.5f);
 		}
+	}
+
+	// number (or OFF) and unit inside a value box, including the typing state
+	void drawLcdContent (int tg)
+	{
+		const bool rn = rnnMode ();
+		float bx, by, bw, bh;
+		lcdRect (tg, bx, by, bw, bh);
+		const float rightOff = rn ? 40.f : 44.f, unitOff = rn ? 11.f : 14.f;
+		const float numY = by + (bh - 40.f) / 2.f + 1.5f, unitY = by + bh / 2.f - 2.f;
+		const double t = tg == 1 ? graceNorm () : curNorm ();
+		const int v = quant (tg, t);
+		wchar_t b[16];
+		swprintf (b, 16, L"%d", v);
+		const bool ed = editing && editTarget == tg;
+		if (!ed && rn && tg == 0 && v == 0)
+		{
+			text (L"OFF", 26, DWRITE_FONT_WEIGHT_LIGHT, C (150, 150, 156), bx + bw / 2.f, by + (bh - 35.f) / 2.f, kCenter, 1.5f);
+			return;
+		}
+		if (!ed)
+		{
+			text (b, 30, DWRITE_FONT_WEIGHT_LIGHT, cWhite, bx + bw - rightOff, numY, kRight);
+			if (rn)
+				text (tg == 1 ? L"ms" : L"%", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, bx + bw - unitOff, unitY, kRight);
+			return;
+		}
+		strokeRR (bx + 0.5f, by + 0.5f, bw - 1, bh - 1, 8, C (255, 255, 255, 150), 1.5f);
+		const float right = bx + bw - rightOff;
+		float w = 0.f;
+		if (!editBuf.empty ())
+		{
+			IDWriteTextLayout* l = layoutFor (editBuf.c_str (), 30, DWRITE_FONT_WEIGHT_LIGHT, kRight, 0.f);
+			DWRITE_TEXT_METRICS m {};
+			l->GetMetrics (&m);
+			w = m.widthIncludingTrailingWhitespace;
+		}
+		if (editFresh && w > 0.f)
+			fillRect (right - w - 3, by + 7, w + 6, bh - 14, C (255, 255, 255, 60));
+		if (!editBuf.empty ())
+			text (editBuf.c_str (), 30, DWRITE_FONT_WEIGHT_LIGHT, cWhite, right, numY, kRight);
+		if (((GetTickCount () - caretT) / 530) % 2 == 0 && !editFresh)
+			line (right + 2, by + 9, right + 2, by + bh - 9, cWhite, 1.5f);
 	}
 
 	void drawSliderDynamic ()
 	{
 		const bool rn = rnnMode ();
-		// bypass pill
+		// bypass pill (top right of the display in RNNoise mode, next to the value box in Speex mode)
 		{
-			bool on = byp->load ();
+			float px, py, pw, ph;
+			bypassRect (px, py, pw, ph);
+			const bool on = byp->load ();
 			if (on)
-				rt->FillRoundedRectangle (RR (kBypX, kBypY, kBypW, kBypH, kBypH / 2), vgrad (gPill, kBypY, kBypY + kBypH));
+				rt->FillRoundedRectangle (RR (px, py, pw, ph, ph / 2), vgrad (gPill, py, py + ph));
 			else
-				fillRR (kBypX, kBypY, kBypW, kBypH, kBypH / 2, C (22, 22, 24));
-			strokeRR (kBypX + 0.5f, kBypY + 0.5f, kBypW - 1, kBypH - 1, kBypH / 2 - 0.5f,
-			          on ? C (255, 255, 255, 90) : C (84, 84, 90, 170));
+				fillRR (px, py, pw, ph, ph / 2, C (22, 22, 24));
+			strokeRR (px + 0.5f, py + 0.5f, pw - 1, ph - 1, ph / 2 - 0.5f, on ? C (255, 255, 255, 90) : C (84, 84, 90, 170));
 			solid->SetColor (on ? C (24, 24, 26) : C (96, 96, 102));
-			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (kBypX + 14, kBypY + kBypH / 2), 3.2f, 3.2f), solid.Get ());
-			text (L"BYPASS", 9, DWRITE_FONT_WEIGHT_SEMI_BOLD, on ? C (24, 24, 26) : cMuted, kBypX + 54, kBypY + 5.2f, kCenter, 1.4f);
+			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (px + (rn ? 14.f : 15.f), py + ph / 2), rn ? 3.2f : 3.5f, rn ? 3.2f : 3.5f), solid.Get ());
+			text (L"BYPASS", rn ? 9 : 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, on ? C (24, 24, 26) : cMuted, px + (rn ? 54.f : 58.f),
+			      py + (rn ? 5.2f : 6.5f), kCenter, rn ? 1.4f : 1.5f);
 		}
 
-		const float bx = kLcdX, by = kLcdY, bw = kLcdW;
-		double t = curNorm ();
-		wchar_t b[16];
-		swprintf (b, 16, L"%d", quant (0, t));
-		if (!editing && rn && quant (0, t) == 0)
-			text (L"OFF", 28, DWRITE_FONT_WEIGHT_LIGHT, C (150, 150, 156), bx + bw / 2.f, by + 6.f, kCenter, 1.5f);
-		else if (!editing)
-		{
-			text (b, 30, DWRITE_FONT_WEIGHT_LIGHT, cWhite, bx + bw - 36, by + 4.5f, kRight);
-			if (rn)
-				text (L"%", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, bx + bw - 11, by + 21, kRight);
-		}
-		else
-		{
-			strokeRR (bx + 0.5f, by + 0.5f, bw - 1, kLcdH - 1, 8, C (255, 255, 255, 150), 1.5f);
-			const float right = bx + bw - 36;
-			float w = 0.f;
-			if (!editBuf.empty ())
-			{
-				IDWriteTextLayout* l = layoutFor (editBuf.c_str (), 30, DWRITE_FONT_WEIGHT_LIGHT, kRight, 0.f);
-				DWRITE_TEXT_METRICS m {};
-				l->GetMetrics (&m);
-				w = m.widthIncludingTrailingWhitespace;
-			}
-			if (editFresh && w > 0.f)
-				fillRect (right - w - 3, by + 7, w + 6, kLcdH - 14, C (255, 255, 255, 60));
-			if (!editBuf.empty ())
-				text (editBuf.c_str (), 30, DWRITE_FONT_WEIGHT_LIGHT, cWhite, right, by + 4.5f, kRight);
-			if (((GetTickCount () - caretT) / 530) % 2 == 0 && !editFresh)
-				line (right + 2, by + 9, right + 2, by + kLcdH - 9, cWhite, 1.5f);
-		}
-
-		const float kx = static_cast<float> (kTrackL + t * (kTrackR - kTrackL));
+		drawLcdContent (0);
 		if (rn)
-		{
-			// live voice probability fills the groove; the knob is the gate threshold
-			const float pw = std::clamp (vadShown, 0.f, 1.f) * (kTrackR - kTrackL + 6);
-			if (pw > 2.f)
-			{
-				cur->FillRoundedRectangle (RR (kTrackL - 3, kTrackY - 2.5f, pw, 5, 2.5f), vgrad (gSlider, kTrackY - 3, kTrackY + 3));
-				fillRR (kTrackL - 3, kTrackY - 3, pw, 6, 3, C (255, 255, 255, 30));
-			}
-			const float thr = static_cast<float> (t);
-			const bool voice = vadShown >= (thr > 0.f ? thr : 0.5f);
-			const float sx = kTrackR + 4.f;
-			text (voice ? L"VOICE" : L"NO VOICE", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, voice ? cWhite : cDim, sx, kTrackY - 38.f, kRight, 1.4f);
-			solid->SetColor (voice ? cWhite : cDim);
-			cur->FillEllipse (D2D1::Ellipse (D2D1::Point2F (sx - (voice ? 56.f : 76.f), kTrackY - 31.f), 3.f, 3.f), solid.Get ());
-		}
-		else if (kx > kTrackL + 1)
-		{
-			fillRR (kTrackL - 3, kTrackY - 3, kx - kTrackL + 3, 6, 3, C (255, 255, 255, 34));
-			cur->FillRoundedRectangle (RR (kTrackL - 3, kTrackY - 2.5f, kx - kTrackL + 3, 5, 2.5f), vgrad (gSlider, kTrackY - 3, kTrackY + 3));
-		}
-		// ticks
-		const int nt = rn ? 20 : 30, per = rn ? 5 : 5;
-		for (int i = 0; i <= nt; ++i)
-		{
-			float x = std::floor (kTrackL + (kTrackR - kTrackL) * i / float (nt)) + 0.5f;
-			bool major = i % per == 0, lit = x <= kx + 0.5f;
-			line (x, kTrackY + 16.f, x, kTrackY + (major ? 22.f : 19.f), lit ? C (220, 220, 225) : cDim);
-		}
-		// knob (smaller than before)
-		drawCapsule (kx, kTrackY, 18.f, 34.f, (dragging && dragTarget == 0) || hoverSlider, 3);
+			drawLcdContent (1);
 
-		if (rn) // grace period slider: same look as the main one, a bit smaller
+		if (!rn)
 		{
-			const float g = static_cast<float> (graceNorm ());
-			const float gx = kGrL + g * (kGrR - kGrL);
-			fillRR (kGrL - 5, kGrY - 5, kGrR - kGrL + 10, 10, 5, C (6, 6, 7));
-			strokeRR (kGrL - 4.5f, kGrY - 4.5f, kGrR - kGrL + 9, 9, 4.5f, C (66, 66, 72), 1.f);
-			line (kGrL, kGrY - 3.5f, kGrR, kGrY - 3.5f, C (0, 0, 0, 160));
-			if (gx > kGrL + 1)
+			// Speex: unchanged from v1.1
+			const double t = curNorm ();
+			const float kx = static_cast<float> (kTrackL + t * (kTrackR - kTrackL));
+			if (kx > kTrackL + 1)
 			{
-				fillRR (kGrL - 3, kGrY - 3, gx - kGrL + 3, 6, 3, C (255, 255, 255, 34));
-				cur->FillRoundedRectangle (RR (kGrL - 3, kGrY - 2.5f, gx - kGrL + 3, 5, 2.5f), vgrad (gSlider, kGrY - 3, kGrY + 3));
+				fillRR (kTrackL - 3, kTrackY - 3, kx - kTrackL + 3, 6, 3, C (255, 255, 255, 34));
+				cur->FillRoundedRectangle (RR (kTrackL - 3, kTrackY - 2.5f, kx - kTrackL + 3, 5, 2.5f), vgrad (gSlider, kTrackY - 3, kTrackY + 3));
 			}
-			for (int i = 0; i <= 10; ++i)
+			for (int i = 0; i <= 30; ++i)
 			{
-				const float x = std::floor (kGrL + (kGrR - kGrL) * i / 10.f) + 0.5f;
-				const bool major = i % 5 == 0, lit = x <= gx + 0.5f;
-				line (x, kGrY + 14.f, x, kGrY + (major ? 20.f : 17.f), lit ? C (220, 220, 225) : cDim);
+				float x = std::floor (kTrackL + (kTrackR - kTrackL) * i / 30.f) + 0.5f;
+				bool major = i % 5 == 0, lit = x <= kx + 0.5f;
+				line (x, kTrackY + 16.f, x, kTrackY + (major ? 26.f : 21.f), lit ? C (220, 220, 225) : cDim);
 			}
-			drawCapsule (gx, kGrY, 14.f, 26.f, dragging && dragTarget == 1, 2);
-			wchar_t gb[16];
-			swprintf (gb, 16, L"%d ms", quant (1, g));
-			text (gb, 11, DWRITE_FONT_WEIGHT_NORMAL, cText, kGrR + 6.f, kGrLabelY - 1.f, kRight);
+			drawCapsule (kx, kTrackY, 22.f, 40.f, (dragging && dragTarget == 0) || hoverSlider, 3, 4.f);
+			return;
+		}
+
+		// RNNoise: two identical rows
+		for (int tg = 1; tg >= 0; --tg)
+		{
+			const float ry = rowY (tg);
+			const double t = tg == 1 ? graceNorm () : curNorm ();
+			const float kx = static_cast<float> (trL () + t * (trR () - trL ()));
+			if (tg == 1)
+			{
+				if (kx > trL () + 1)
+				{
+					fillRR (trL () - 3, ry - 3, kx - trL () + 3, 6, 3, C (255, 255, 255, 34));
+					cur->FillRoundedRectangle (RR (trL () - 3, ry - 2.5f, kx - trL () + 3, 5, 2.5f), vgrad (gSlider, ry - 3, ry + 3));
+				}
+			}
+			else
+			{
+				// live voice probability fills the groove; the knob is the gate threshold
+				const float pw = std::clamp (vadShown, 0.f, 1.f) * (trR () - trL () + 6);
+				if (pw > 2.f)
+				{
+					cur->FillRoundedRectangle (RR (trL () - 3, ry - 2.5f, pw, 5, 2.5f), vgrad (gSlider, ry - 3, ry + 3));
+					fillRR (trL () - 3, ry - 3, pw, 6, 3, C (255, 255, 255, 30));
+				}
+				const bool voice = vadShown >= (t > 0.0 ? static_cast<float> (t) : 0.5f);
+				const float sx = trR () + 4.f;
+				text (voice ? L"VOICE" : L"NO VOICE", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, voice ? cWhite : cDim, sx, ry - 32.f, kRight, 1.4f);
+				solid->SetColor (voice ? cWhite : cDim);
+				cur->FillEllipse (D2D1::Ellipse (D2D1::Point2F (sx - (voice ? 56.f : 76.f), ry - 25.5f), 3.f, 3.f), solid.Get ());
+			}
+			const int nt = tg == 1 ? 10 : 20;
+			for (int i = 0; i <= nt; ++i)
+			{
+				float x = std::floor (trL () + (trR () - trL ()) * i / float (nt)) + 0.5f;
+				bool major = i % 5 == 0, lit = x <= kx + 0.5f;
+				line (x, ry + 15.f, x, ry + (major ? 21.f : 18.f), lit ? C (220, 220, 225) : cDim);
+			}
+			drawCapsule (kx, ry, 18.f, 34.f, dragging && dragTarget == tg ? true : (tg == 0 && hoverSlider), 3);
 		}
 
 		// "i" icons
@@ -1050,7 +1115,7 @@ private:
 			const bool h = hoverInfo == i;
 			solid->SetColor (h ? cWhite : C (130, 130, 136));
 			cur->DrawEllipse (D2D1::Ellipse (D2D1::Point2F (ix, iy), 7.f, 7.f), solid.Get (), 1.3f);
-			text (L"i", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, h ? cWhite : C (150, 150, 156), ix, iy - 7.8f, kCenter);
+			text (L"i", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, h ? cWhite : C (150, 150, 156), ix, iy - 6.3f, kCenter);
 		}
 	}
 
@@ -1063,7 +1128,7 @@ private:
 		line (kW / 2.f - 60, 262.5f, kW / 2.f + 60, 262.5f, C (255, 255, 255, 40));
 		text (L"MADE BY", 11, DWRITE_FONT_WEIGHT_SEMI_BOLD, cMuted, kW / 2.f, 282, kCenter, 2.5f);
 		text (L"elem3n7ary", 34, DWRITE_FONT_WEIGHT_NORMAL, cWhite, kW / 2.f, 295, kCenter, 0.5f, true);
-		text (L"Based on SpeexDSP (Xiph.Org, BSD license)", 12, DWRITE_FONT_WEIGHT_NORMAL, cMuted, kW / 2.f, 380, kCenter);
+		text (L"Based on SpeexDSP and RNNoise (Xiph.Org, BSD license)", 12, DWRITE_FONT_WEIGHT_NORMAL, cMuted, kW / 2.f, 380, kCenter);
 	}
 
 	void buildStatic ()
@@ -1301,12 +1366,13 @@ private:
 					self->dirty = true;
 					return 0;
 				}
-				if (self->editing && !self->hitLcd (x, y))
+				const int lcd = self->hitLcdIdx (x, y);
+				if (self->editing && lcd != self->editTarget)
 					self->commitEdit ();
-				if (self->tab == 0 && self->hitLcd (x, y))
+				if (lcd >= 0)
 				{
 					if (!self->editing)
-						self->startEdit ();
+						self->startEdit (lcd);
 					return 0;
 				}
 				if (self->tab == 0 && self->hitBypass (x, y))
@@ -1318,12 +1384,12 @@ private:
 				if (t >= 0)
 				{
 					self->tab = t;
+					self->menuOpen = false;
 					self->dirty = true;
 				}
 				else if (self->tab == 0 && (self->onSlider (x, y) || self->onGrace (x, y)))
 				{
-					const bool grace = self->onGrace (x, y);
-					self->dragTarget = grace ? 1 : 0;
+					self->dragTarget = self->onGrace (x, y) ? 1 : 0;
 					self->dragging = true;
 					self->dragNorm = self->normFor (self->dragTarget);
 					self->lastSentDb = self->quant (self->dragTarget, self->dragNorm);
@@ -1331,7 +1397,7 @@ private:
 					SetCapture (h);
 					self->ctrl->beginEdit (self->dragParam ());
 					if (!(GetKeyState (VK_SHIFT) & 0x8000))
-						self->setNorm ((x - (grace ? kGrL : kTrackL)) / double (grace ? kGrR - kGrL : kTrackR - kTrackL));
+						self->setNorm ((x - self->trL ()) / double (self->trR () - self->trL ()));
 				}
 				return 0;
 			}
@@ -1340,7 +1406,7 @@ private:
 					return 0;
 				if (self->dragging)
 				{
-					const double l = self->dragTarget == 1 ? kGrL : kTrackL, w = self->dragTarget == 1 ? kGrR - kGrL : kTrackR - kTrackL;
+					const double l = self->trL (), w = self->trR () - self->trL ();
 					if (GetKeyState (VK_SHIFT) & 0x8000) // fine adjust: 5x slower, relative
 						self->setNorm (self->dragNorm + (x - self->lastX) / (5.0 * w));
 					else
@@ -1417,7 +1483,7 @@ private:
 				bool hand = self && (self->hitTab (pt.x, pt.y) >= 0 || (self->tab == 0 && (self->dragging || self->onSlider (pt.x, pt.y) || self->onGrace (pt.x, pt.y))));
 				if (self && (self->hitPill (pt.x, pt.y) || (self->menuOpen && (self->hitMenuRow (pt.x, pt.y) == 0 || (self->hitMenuRow (pt.x, pt.y) > 0 && self->rnnoiseOk ())))))
 					hand = true;
-				bool ibeam = self && self->tab == 0 && !self->menuOpen && self->hitLcd (pt.x, pt.y);
+				bool ibeam = self && !self->menuOpen && self->hitLcdIdx (pt.x, pt.y) >= 0;
 				if (self && self->tab == 0 && self->hitBypass (pt.x, pt.y))
 					hand = true;
 				SetCursor (LoadCursor (nullptr, ibeam ? IDC_IBEAM : (hand ? IDC_HAND : IDC_ARROW)));
@@ -1438,10 +1504,16 @@ private:
 			case WM_MOUSEWHEEL:
 				if (self && self->tab == 0)
 				{
-					double step = (GET_WHEEL_DELTA_WPARAM (wp) / 120.0) / self->mainRange ();
-					self->ctrl->beginEdit (self->mainParam ());
-					self->setNorm (self->norm () + step);
-					self->ctrl->endEdit (self->mainParam ());
+					POINT pt;
+					GetCursorPos (&pt);
+					ScreenToClient (h, &pt);
+					const int tg = self->onGrace (pt.x, pt.y) ? 1 : 0;
+					const double range = tg == 1 ? 50.0 : self->mainRange (); // grace moves in 10 ms steps
+					const double step = (GET_WHEEL_DELTA_WPARAM (wp) / 120.0) / range;
+					const ParamID pid = tg == 1 ? kVadGrace : self->mainParam ();
+					self->ctrl->beginEdit (pid);
+					self->setNorm (self->normFor (tg) + step, tg);
+					self->ctrl->endEdit (pid);
 				}
 				return 0;
 		}
@@ -1462,6 +1534,7 @@ private:
 	bool dragging = false, dirty = true, hoverSlider = false;
 	int tab = 0, lastX = 0, lastSentDb = 0, skip = 0;
 	bool editing = false, editFresh = false, menuOpen = false;
+	int editTarget = 0;
 	int hoverInfo = -1; // which "i" icon the mouse is over
 	int hoverRow = -1, dragTarget = 0; // 0 = main slider, 1 = grace slider
 	float vadShown = 0.f, rVad = 0.f;

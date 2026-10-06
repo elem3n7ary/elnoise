@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Speex Noise Suppression - VST3 plugin
+// elNoise - VST3 microphone noise suppression plugin
 // Copyright (C) 2026 elem3n7ary
 //
 // This program is free software: you can redistribute it and/or modify it under the terms of the
@@ -7,7 +7,7 @@
 // License, or (at your option) any later version. It is distributed WITHOUT ANY WARRANTY.
 // See the LICENSE file. Bundled third-party code: see THIRD_PARTY_LICENSES/.
 
-// Speex noise suppression VST3 - mirrors OBS "Noise Suppression" filter (Speex method).
+// elNoise: Speex noise suppression engine, mirrors the OBS "Noise Suppression" filter (Speex method).
 // GUI: Direct2D / DirectWrite (GPU accelerated), frames paced by the display (DwmFlush).
 #include "public.sdk/source/main/pluginfactory.h"
 #include "public.sdk/source/vst/vstsinglecomponenteffect.h"
@@ -21,7 +21,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d2d1.h>
-#include <dwrite_1.h>
+#include <dwrite_3.h>
 #include <dwmapi.h>
 #include <wrl/client.h>
 #pragma comment(lib, "d2d1.lib")
@@ -29,6 +29,10 @@
 #pragma comment(lib, "dwmapi.lib")
 
 #include <speex/speex_preprocess.h>
+extern "C" {
+#include <rnnoise.h>
+DenoiseState* elnoise_create_light (void); // little model, see rnnoise_wrapper.c
+}
 
 #include <algorithm>
 #include <atomic>
@@ -45,7 +49,7 @@ using Microsoft::WRL::ComPtr;
 
 static const FUID kPluginUID (0x5A3C1E70, 0x9B2F4D18, 0xA6C47D02, 0x3E8B5F91);
 
-enum : ParamID { kBypass = 99, kSuppression = 100 };
+enum : ParamID { kMethod = 98, kBypass = 99, kSuppression = 100, kVadThreshold = 101, kVadGrace = 102 };
 static constexpr double kMinDb = -60.0;
 static constexpr double kMaxDb = 0.0;
 static constexpr double kDefaultDb = -30.0; // OBS default
@@ -176,8 +180,11 @@ private:
 class SpeexView : public CPluginView
 {
 public:
-	SpeexView (EditController* c, std::atomic<double>* db, std::atomic<bool>* bp, Analyzer* in, Analyzer* out)
-	: CPluginView (nullptr), ctrl (c), dbValue (db), byp (bp), aIn (in), aOut (out)
+	SpeexView (EditController* c, std::atomic<double>* db, std::atomic<bool>* bp, std::atomic<int>* mt,
+	           const std::atomic<double>* sr, std::atomic<double>* vt, std::atomic<double>* vg,
+	           const std::atomic<float>* vp, Analyzer* in, Analyzer* out)
+	: CPluginView (nullptr), ctrl (c), dbValue (db), byp (bp), meth (mt), rate (sr), vthr (vt), vgrace (vg), vprob (vp),
+	  aIn (in), aOut (out)
 	{
 		rect = ViewRect (0, 0, kW, kH);
 		for (int b = 0; b < Analyzer::kBands; ++b)
@@ -199,6 +206,7 @@ public:
 		                                 reinterpret_cast<IUnknown**> (dw.GetAddressOf ()))))
 			return kResultFalse;
 		pickFont ();
+		loadBrandFont ();
 		registerClass ();
 		hwnd = CreateWindowExW (0, kClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, kW,
 		                        kH, static_cast<HWND> (parent), nullptr, GetModuleHandleW (nullptr), this);
@@ -235,6 +243,11 @@ public:
 		releaseTarget ();
 		layouts.clear ();
 		formats.clear ();
+		brandColl.Reset ();
+		if (dw5 && memLoader)
+			dw5->UnregisterFontFileLoader (memLoader.Get ());
+		memLoader.Reset ();
+		dw5.Reset ();
 		return CPluginView::removed ();
 	}
 
@@ -263,8 +276,13 @@ private:
 	static constexpr float kDispT = 70.f, kDispB = 272.f;
 	static constexpr float kPlotL = 34.f, kPlotR = kW - 34.f, kPlotT = 102.f, kPlotB = 218.f;
 	static constexpr float kDbTop = 0.f, kDbBot = -100.f;
-	static constexpr float kTrackL = 44.f, kTrackR = kW - 44.f, kTrackY = 372.f;
-	static constexpr float kTabX0 = kW - 178.f, kTabMid = kW - 99.f, kTabX1 = kW - 20.f;
+	static constexpr float kTrackL = 44.f, kTrackR = kW - 44.f, kTrackY = 384.f;
+	static constexpr float kPillX = 180.f, kPillY = 12.f, kPillW = 200.f, kPillH = 34.f;
+	static constexpr float kMethodLabelDy = 12.0f, kMethodValueDy = 8.6f; // tuned so both texts share one center line
+	static constexpr float kMenuX = 166.f, kMenuY = 54.f, kMenuW = 228.f, kRowH = 50.f;
+	static constexpr const wchar_t* kMethodNames[3] = {L"SPEEX", L"RNNOISE", L"RNNOISE LITE"};
+	static constexpr float kGrL = 44.f, kGrR = 398.f, kGrY = 319.f, kGrLabelY = 289.f; // grace-period slider (RNNoise modes), next to the number
+	static constexpr float kTabX0 = kW - 172.f, kTabMid = kW - 94.f, kTabX1 = kW - 16.f;
 
 	static Clr C (int r, int g, int b, int a = 255) { return D2D1::ColorF (r / 255.f, g / 255.f, b / 255.f, a / 255.f); }
 	const Clr cWhite = C (240, 240, 243), cText = C (205, 205, 210), cMuted = C (128, 128, 134), cDim = C (74, 74, 80),
@@ -286,11 +304,30 @@ private:
 	}
 
 	//-------------------------------------------------------------- value handling
-	double norm () const { return (dbValue->load () - kMinDb) / (kMaxDb - kMinDb); }
-	double curNorm () const { return dragging ? dragNorm : norm (); }
+	bool rnnMode () const { return meth->load () > 0; }
+	ParamID mainParam () const { return rnnMode () ? kVadThreshold : kSuppression; }
+	ParamID dragParam () const { return dragTarget == 1 ? kVadGrace : mainParam (); }
+	double normFor (int target) const
+	{
+		if (target == 1)
+			return vgrace->load () / 500.0;
+		return rnnMode () ? vthr->load () / 100.0 : (dbValue->load () - kMinDb) / (kMaxDb - kMinDb);
+	}
+	double norm () const { return normFor (0); }
+	double curNorm () const { return dragging && dragTarget == 0 ? dragNorm : norm (); }
+	double graceNorm () const { return dragging && dragTarget == 1 ? dragNorm : normFor (1); }
+	// value shown / sent for a normalized position (whole dB, whole percent, 10 ms steps)
+	int quant (int target, double t) const
+	{
+		if (target == 1)
+			return static_cast<int> (std::lround (t * 50.0)) * 10;
+		return rnnMode () ? static_cast<int> (std::lround (t * 100.0))
+		                  : static_cast<int> (std::lround (kMinDb + t * (kMaxDb - kMinDb)));
+	}
+	double mainRange () const { return rnnMode () ? 100.0 : (kMaxDb - kMinDb); }
 
 	// While dragging, the view tracks the value locally and only talks to the host when the
-	// rounded dB value changes (Speex only takes whole dB anyway).
+	// rounded value changes (Speex only takes whole dB anyway).
 	void setNorm (double t)
 	{
 		t = std::clamp (t, 0.0, 1.0);
@@ -298,30 +335,83 @@ private:
 		if (dragging)
 		{
 			dragNorm = t;
-			int db = static_cast<int> (std::lround (kMinDb + t * (kMaxDb - kMinDb)));
-			if (db != lastSentDb)
+			int v = quant (dragTarget, t);
+			if (v != lastSentDb)
 			{
-				lastSentDb = db;
-				ctrl->setParamNormalized (kSuppression, t);
-				ctrl->performEdit (kSuppression, t);
+				lastSentDb = v;
+				ctrl->setParamNormalized (dragParam (), t);
+				ctrl->performEdit (dragParam (), t);
 			}
 			return;
 		}
-		ctrl->setParamNormalized (kSuppression, t);
-		ctrl->performEdit (kSuppression, t);
+		ctrl->setParamNormalized (mainParam (), t);
+		ctrl->performEdit (mainParam (), t);
+	}
+
+	// "i" icons next to headings: hover shows an explanation.
+	// Speex: [0] suppression. RNNoise: [0] voice gate, [1] grace period
+	int infoCount () const { return rnnMode () ? 2 : 1; }
+	float headWidth (const wchar_t* t, float size, float track) const
+	{
+		DWRITE_TEXT_METRICS m {};
+		const_cast<SpeexView*> (this)->layoutFor (t, size, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, track)->GetMetrics (&m);
+		return m.widthIncludingTrailingWhitespace - track;
+	}
+	static constexpr float kInfoY = kTrackY - 31.f;
+	void infoPos (int i, float& x, float& y) const
+	{
+		if (!rnnMode ())
+		{
+			x = 28.f + headWidth (L"SUPPRESSION", 13, 2.2f) + 14.f;
+			y = 298.f + 8.5f;
+		}
+		else if (i == 0)
+		{
+			x = kTrackL + headWidth (L"VOICE GATE", 13, 2.2f) + 14.f;
+			y = kInfoY;
+		}
+		else
+		{
+			x = kGrL + headWidth (L"GRACE", 10, 1.4f) + 12.f;
+			y = kGrLabelY + 6.8f;
+		}
+	}
+	const wchar_t* infoText (int i) const
+	{
+		if (!rnnMode ())
+			return L"Maximum noise reduction (Speex). Lower value = stronger. Very quiet noise is removed even at 0 dB.";
+		return i == 0 ? L"Mutes the mic when the model hears no voice (0% = off). Raise it until background noise is cut between words."
+		              : L"How long the gate stays open after the voice stops, so word endings are not cut.";
+	}
+	int hitInfoIdx (int x, int y) const
+	{
+		if (tab != 0)
+			return -1;
+		for (int i = 0; i < infoCount (); ++i)
+		{
+			float ix, iy;
+			infoPos (i, ix, iy);
+			if ((x - ix) * (x - ix) + (y - iy) * (y - iy) <= 11.f * 11.f)
+				return i;
+		}
+		return -1;
 	}
 
 	bool onSlider (int x, int y) const
 	{
-		return y >= 330 && y <= 418 && x >= kTrackL - 20 && x <= kTrackR + 20;
+		return y >= 361 && y <= 420 && x >= kTrackL - 20 && x <= kTrackR + 20;
 	}
-	static constexpr float kLcdX = kW - 156.f, kLcdY = 292.f, kLcdW = 128.f, kLcdH = 46.f;
+	bool onGrace (int x, int y) const
+	{
+		return rnnMode () && y >= 303 && y <= 337 && x >= kGrL - 10 && x <= kGrR + 10;
+	}
+	static constexpr float kLcdW = 106.f, kLcdX = kW - 28.f - kLcdW, kLcdY = 288.f, kLcdH = 46.f;
 	bool hitLcd (int x, int y) const
 	{
 		return x >= kLcdX && x <= kLcdX + kLcdW && y >= kLcdY && y <= kLcdY + kLcdH;
 	}
 
-	static constexpr float kBypX = 288.f, kBypY = 301.f, kBypW = 100.f, kBypH = 26.f;
+	static constexpr float kBypW = 94.f, kBypH = 24.f, kBypX = kW - 28.f - kBypW, kBypY = 75.f; // top-right of the display
 	bool hitBypass (int x, int y) const
 	{
 		return x >= kBypX && x <= kBypX + kBypW && y >= kBypY && y <= kBypY + kBypH;
@@ -341,7 +431,7 @@ private:
 	{
 		editing = true;
 		editFresh = true; // first typed character replaces the whole value
-		editBuf = std::to_wstring (static_cast<int> (std::lround (kMinDb + curNorm () * (kMaxDb - kMinDb))));
+		editBuf = std::to_wstring (quant (0, curNorm ()));
 		caretT = GetTickCount ();
 		SetFocus (hwnd);
 		dirty = true;
@@ -355,12 +445,18 @@ private:
 		if (editBuf.empty () || editBuf == L"-")
 			return;
 		long v = std::wcstol (editBuf.c_str (), nullptr, 10);
-		if (v > 0)
-			v = -v; // the range is 0..-60, so "30" means -30
-		v = std::clamp<long> (v, static_cast<long> (kMinDb), static_cast<long> (kMaxDb));
-		ctrl->beginEdit (kSuppression);
-		setNorm ((v - kMinDb) / (kMaxDb - kMinDb));
-		ctrl->endEdit (kSuppression);
+		double t;
+		if (rnnMode ())
+			t = std::clamp<long> (v, 0, 100) / 100.0; // percent
+		else
+		{
+			if (v > 0)
+				v = -v; // the range is 0..-60, so "30" means -30
+			t = (std::clamp<long> (v, static_cast<long> (kMinDb), static_cast<long> (kMaxDb)) - kMinDb) / (kMaxDb - kMinDb);
+		}
+		ctrl->beginEdit (mainParam ());
+		setNorm (t);
+		ctrl->endEdit (mainParam ());
 	}
 	void cancelEdit ()
 	{
@@ -376,7 +472,7 @@ private:
 			else if (!editBuf.empty ())
 				editBuf.pop_back ();
 		}
-		else if ((ch >= L'0' && ch <= L'9') || ch == L'-')
+		else if ((ch >= L'0' && ch <= L'9') || (ch == L'-' && !rnnMode ()))
 		{
 			if (editFresh)
 				editBuf.clear ();
@@ -390,6 +486,29 @@ private:
 		editFresh = false;
 		caretT = GetTickCount ();
 		dirty = true;
+	}
+
+	// RNNoise only works at 48 kHz
+	bool rnnoiseOk () const { return std::fabs (rate->load () - 48000.0) < 1.0; }
+	void chooseMethod (int m)
+	{
+		ctrl->beginEdit (kMethod);
+		ctrl->setParamNormalized (kMethod, m / 2.0);
+		ctrl->performEdit (kMethod, m / 2.0);
+		ctrl->endEdit (kMethod);
+		dirty = true;
+	}
+
+	bool hitPill (int x, int y) const
+	{
+		return x >= kPillX && x <= kPillX + kPillW && y >= kPillY && y <= kPillY + kPillH;
+	}
+	// -1 = none, 0..2 = method row
+	int hitMenuRow (int x, int y) const
+	{
+		if (x < kMenuX || x > kMenuX + kMenuW || y < kMenuY + 6 || y > kMenuY + 6 + 3 * kRowH)
+			return -1;
+		return static_cast<int> ((y - kMenuY - 6) / kRowH);
 	}
 
 	int hitTab (int x, int y) const
@@ -409,6 +528,52 @@ private:
 		if (SUCCEEDED (dw->GetSystemFontCollection (&coll, FALSE)) &&
 		    SUCCEEDED (coll->FindFamilyName (L"Segoe UI Variable Display", &idx, &ok)) && ok)
 			fontFamily = L"Segoe UI Variable Display";
+	}
+
+	// Fredoka Regular is embedded as a resource (RCDATA 101) and registered privately for this window
+	void loadBrandFont ()
+	{
+		if (FAILED (dw.As (&dw5)))
+			return;
+		HMODULE mod = nullptr;
+		if (!GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                         reinterpret_cast<LPCWSTR> (&SpeexView::registerClass), &mod))
+			return;
+		HRSRC res = FindResourceW (mod, MAKEINTRESOURCEW (101), RT_RCDATA);
+		if (!res)
+			return;
+		const void* data = LockResource (LoadResource (mod, res));
+		DWORD size = SizeofResource (mod, res);
+		ComPtr<IDWriteFontFile> file;
+		ComPtr<IDWriteFontSetBuilder1> builder;
+		ComPtr<IDWriteFontSet> set;
+		if (!data || FAILED (dw5->CreateInMemoryFontFileLoader (&memLoader)) ||
+		    FAILED (dw5->RegisterFontFileLoader (memLoader.Get ())) ||
+		    FAILED (memLoader->CreateInMemoryFontFileReference (dw5.Get (), data, size, nullptr, &file)) ||
+		    FAILED (dw5->CreateFontSetBuilder (&builder)) || FAILED (builder->AddFontFile (file.Get ())) ||
+		    FAILED (builder->CreateFontSet (&set)) || FAILED (dw5->CreateFontCollectionFromFontSet (set.Get (), &brandColl)))
+		{
+			brandColl.Reset (); // falls back to the system UI font
+			return;
+		}
+		brandFamily.clear ();
+		ComPtr<IDWriteFontFamily> fam;
+		ComPtr<IDWriteLocalizedStrings> names;
+		if (brandColl->GetFontFamilyCount () > 0 && SUCCEEDED (brandColl->GetFontFamily (0, &fam)) &&
+		    SUCCEEDED (fam->GetFamilyNames (&names)) && names->GetCount () > 0)
+		{
+			UINT32 len = 0;
+			if (SUCCEEDED (names->GetStringLength (0, &len)))
+			{
+				brandFamily.resize (len + 1);
+				if (FAILED (names->GetString (0, &brandFamily[0], len + 1)))
+					brandFamily.clear ();
+				else
+					brandFamily.resize (len);
+			}
+		}
+		if (brandFamily.empty ())
+			brandColl.Reset ();
 	}
 
 	void releaseTarget ()
@@ -488,10 +653,11 @@ private:
 		cur->DrawLine (D2D1::Point2F (x0, y0), D2D1::Point2F (x1, y1), solid.Get (), wd);
 	}
 
-	IDWriteTextLayout* layoutFor (const wchar_t* s, float size, DWRITE_FONT_WEIGHT w, Al al, float track)
+	IDWriteTextLayout* layoutFor (const wchar_t* s, float size, DWRITE_FONT_WEIGHT w, Al al, float track, bool brand = false)
 	{
+		brand = brand && brandColl;
 		std::wstring key = s;
-		key += L'\x1';
+		key += brand ? L'\x2' : L'\x1';
 		key += std::to_wstring (static_cast<int> (size * 10)) + L'/' + std::to_wstring (w) + L'/' +
 		       std::to_wstring (al) + L'/' + std::to_wstring (static_cast<int> (track * 10));
 		auto it = layouts.find (key);
@@ -499,12 +665,15 @@ private:
 			return it->second.Get ();
 		if (layouts.size () > 500)
 			layouts.clear ();
-		int fk = static_cast<int> (size * 10) * 1000 + w + al;
+		int fk = static_cast<int> (size * 10) * 1000 + w + al + (brand ? 900000000 : 0);
 		auto& fmt = formats[fk];
 		if (!fmt)
 		{
-			dw->CreateTextFormat (fontFamily.c_str (), nullptr, w, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-			                      size, L"en-us", &fmt);
+			dw->CreateTextFormat (brand ? brandFamily.c_str () : fontFamily.c_str (), brand ? brandColl.Get () : nullptr, w,
+			                      DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &fmt);
+			if (!fmt) // embedded font unavailable: fall back to the system UI font
+				dw->CreateTextFormat (fontFamily.c_str (), nullptr, w, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+				                      size, L"en-us", &fmt);
 			fmt->SetTextAlignment (al == kLeft ? DWRITE_TEXT_ALIGNMENT_LEADING
 			                                   : (al == kCenter ? DWRITE_TEXT_ALIGNMENT_CENTER
 			                                                    : DWRITE_TEXT_ALIGNMENT_TRAILING));
@@ -525,9 +694,9 @@ private:
 
 	// y is the top of the text line box; for kCenter/kRight x is the center / right edge.
 	void text (const wchar_t* s, float size, DWRITE_FONT_WEIGHT w, Clr c, float x, float y, Al al = kLeft,
-	           float track = 0.f)
+	           float track = 0.f, bool brand = false)
 	{
-		IDWriteTextLayout* l = layoutFor (s, size, w, al, track);
+		IDWriteTextLayout* l = layoutFor (s, size, w, al, track, brand);
 		float ox = al == kLeft ? x : (al == kCenter ? x - 200.f : x - 400.f);
 		solid->SetColor (c);
 		cur->DrawTextLayout (D2D1::Point2F (ox, y), l, solid.Get (), D2D1_DRAW_TEXT_OPTIONS_NONE);
@@ -598,11 +767,29 @@ private:
 		line (0, 58.5f, kW, 58.5f, C (0, 0, 0, 200));
 		line (0, 59.5f, kW, 59.5f, C (255, 255, 255, 22));
 
-		// logo
-		strokeRR (20, 15, 28, 28, 7, C (205, 205, 210), 1.8f);
-		text (L"el", 17, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (220, 220, 225), 34, 16.5f, kCenter);
+		// logo (left) followed by "Noise", same rounded font
+		strokeRR (13, 13.7f, 30.6f, 30.6f, 7.65f, C (205, 205, 210), 1.6f);
+		text (L"el", 23, DWRITE_FONT_WEIGHT_NORMAL, C (225, 225, 230), 28.3f, 15.0f, kCenter, 0.f, true);
+		text (L"Noise", 26.4f, DWRITE_FONT_WEIGHT_NORMAL, C (240, 240, 243), 47.9f, 12.4f, kLeft, 0.25f, true);
 
-		text (L"SPEEX NOISE SUPPRESSION", 15, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (208, 208, 213), 62, 20, kLeft, 2.2f);
+		// method selector (center): click to choose the engine
+		fillRR (kPillX, kPillY, kPillW, kPillH, kPillH / 2, C (20, 20, 22));
+		strokeRR (kPillX + 0.5f, kPillY + 0.5f, kPillW - 1, kPillH - 1, kPillH / 2 - 0.5f, C (84, 84, 90, 170));
+		// label and value on one row (same center line), the pair centered in the pill
+		{
+			DWRITE_TEXT_METRICS m1 {}, m2 {};
+			layoutFor (L"METHOD", 8, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, 1.4f)->GetMetrics (&m1);
+			layoutFor (kMethodNames[meth->load ()], 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, kLeft, 0.9f)->GetMetrics (&m2);
+			const float gap = 12.f, w1 = m1.widthIncludingTrailingWhitespace - 1.4f, w2 = m2.widthIncludingTrailingWhitespace - 0.9f;
+			const float x0 = kPillX + (kPillW - 24.f) / 2.f - (w1 + gap + w2) / 2.f;
+			text (L"METHOD", 8, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (100, 100, 106), x0, kPillY + kMethodLabelDy, kLeft, 1.4f);
+			text (kMethodNames[meth->load ()], 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cWhite, x0 + w1 + gap, kPillY + kMethodValueDy, kLeft, 0.9f);
+		}
+		{
+			const float ax = kPillX + kPillW - 20, ay = kPillY + kPillH / 2;
+			line (ax - 4, ay - 1.5f, ax, ay + 2.5f, cText, 1.6f);
+			line (ax, ay + 2.5f, ax + 4, ay - 1.5f, cText, 1.6f);
+		}
 
 		// segmented tabs
 		fillRR (kTabX0, 16, kTabX1 - kTabX0, 26, 13, C (20, 20, 22));
@@ -640,7 +827,6 @@ private:
 		text (L"INPUT", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (150, 150, 156), 52, 80, kLeft, 1.2f);
 		line (108, 87, 126, 87, cOut, 1.6f);
 		text (L"OUTPUT", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (225, 225, 230), 132, 80, kLeft, 1.2f);
-		text (L"SPECTRUM", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (96, 96, 102), kW - 28, 80, kRight, 1.5f);
 
 		// grid
 		const float fmax = std::min (Analyzer::kFMax, 0.45f * 48000.f);
@@ -695,35 +881,64 @@ private:
 
 	void drawSlider ()
 	{
+		const bool rn = rnnMode ();
 		line (0, 283.5f, kW, 283.5f, C (0, 0, 0, 160));
 		line (0, 284.5f, kW, 284.5f, C (255, 255, 255, 20));
 
-		text (L"SUPPRESSION", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cText, 28, 298, kLeft, 2.2f);
-		text (L"Lower value = stronger noise reduction", 11, DWRITE_FONT_WEIGHT_NORMAL, cMuted, 28, 320, kLeft);
+		if (rn) // heading sits right above the slider it belongs to
+			text (L"VOICE GATE", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cText, kTrackL, kTrackY - 40.f, kLeft, 2.2f);
+		else
+		{
+			text (L"SUPPRESSION", 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, cText, 28, 298, kLeft, 2.2f);
+			text (L"Lower value = stronger noise reduction", 12, DWRITE_FONT_WEIGHT_NORMAL, cMuted, 28, 319, kLeft);
+		}
 
 		// LCD
-		const float bx = kW - 156.f, by = 292.f, bw = 128.f, bh = 46.f;
+		const float bx = kLcdX, by = kLcdY, bw = kLcdW, bh = kLcdH;
 		cur->FillRoundedRectangle (RR (bx, by, bw, bh, 8), vgrad (gLcd, by, by + bh));
 		strokeRR (bx + 0.5f, by + 0.5f, bw - 1, bh - 1, 8, C (0, 0, 0), 1.f);
 		line (bx + 6, by + bh + 1.5f, bx + bw - 6, by + bh + 1.5f, C (255, 255, 255, 24));
 		line (bx + 8, by + 1.5f, bx + bw - 8, by + 1.5f, C (255, 255, 255, 12));
-		text (L"dB", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, bx + bw - 14, by + 21, kRight);
+		if (!rn)
+			text (L"dB", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, bx + bw - 10, by + 21, kRight);
 
 		// groove
 		fillRR (kTrackL - 5, kTrackY - 5, kTrackR - kTrackL + 10, 10, 5, C (6, 6, 7));
 		strokeRR (kTrackL - 4.5f, kTrackY - 4.5f, kTrackR - kTrackL + 9, 9, 4.5f, C (66, 66, 72), 1.f);
 		line (kTrackL, kTrackY - 3.5f, kTrackR, kTrackY - 3.5f, C (0, 0, 0, 160));
-		for (int i = 0; i <= 30; i += 5)
+		const int majors = rn ? 5 : 6;
+		for (int i = 0; i <= majors; ++i)
 		{
-			float x = std::floor (kTrackL + (kTrackR - kTrackL) * i / 30.f) + 0.5f;
+			float x = std::floor (kTrackL + (kTrackR - kTrackL) * i / float (majors)) + 0.5f;
 			wchar_t lb[8];
-			swprintf (lb, 8, L"%d", -60 + i * 2);
-			text (lb, 10, DWRITE_FONT_WEIGHT_NORMAL, C (140, 140, 146), x, kTrackY + 28.f, kCenter);
+			swprintf (lb, 8, L"%d", rn ? i * 20 : -60 + i * 10);
+			text (lb, 10, DWRITE_FONT_WEIGHT_NORMAL, C (140, 140, 146), x, kTrackY + 23.f, kCenter);
+		}
+
+		if (rn) // grace period
+			text (L"GRACE", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (118, 118, 124), kGrL, kGrLabelY, kLeft, 1.4f);
+	}
+
+	// capsule-shaped slider knob (same look for every slider)
+	void drawCapsule (float cx, float cy, float w, float h, bool hot, int grips)
+	{
+		const float r = w * 0.42f;
+		for (int i = 4; i >= 1; --i)
+			fillRR (cx - w / 2 - i, cy - h / 2 + i + 3, w + 2 * i, h - 2, r + i, C (0, 0, 0, 22));
+		cur->FillRoundedRectangle (RR (cx - w / 2, cy - h / 2, w, h, r), vgrad (hot ? gKnobHot : gKnob, cy - h / 2, cy + h / 2));
+		strokeRR (cx - w / 2 + 0.5f, cy - h / 2 + 0.5f, w - 1, h - 1, r - 0.5f, C (14, 14, 16), 1.f);
+		line (cx - w / 2 + 5.f, cy - h / 2 + 2.f, cx + w / 2 - 5.f, cy - h / 2 + 2.f, C (255, 255, 255, 150));
+		const float gh = h * 0.23f;
+		for (int k = 0; k < grips; ++k)
+		{
+			const float gx = cx + (k - (grips - 1) / 2.f) * 3.5f;
+			line (gx, cy - gh, gx, cy + gh, C (58, 58, 64), 1.5f);
 		}
 	}
 
 	void drawSliderDynamic ()
 	{
+		const bool rn = rnnMode ();
 		// bypass pill
 		{
 			bool on = byp->load ();
@@ -734,20 +949,26 @@ private:
 			strokeRR (kBypX + 0.5f, kBypY + 0.5f, kBypW - 1, kBypH - 1, kBypH / 2 - 0.5f,
 			          on ? C (255, 255, 255, 90) : C (84, 84, 90, 170));
 			solid->SetColor (on ? C (24, 24, 26) : C (96, 96, 102));
-			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (kBypX + 15, kBypY + kBypH / 2), 3.5f, 3.5f), solid.Get ());
-			text (L"BYPASS", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, on ? C (24, 24, 26) : cMuted, kBypX + 58, kBypY + 6.5f, kCenter, 1.5f);
+			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (kBypX + 14, kBypY + kBypH / 2), 3.2f, 3.2f), solid.Get ());
+			text (L"BYPASS", 9, DWRITE_FONT_WEIGHT_SEMI_BOLD, on ? C (24, 24, 26) : cMuted, kBypX + 54, kBypY + 5.2f, kCenter, 1.4f);
 		}
 
 		const float bx = kLcdX, by = kLcdY, bw = kLcdW;
 		double t = curNorm ();
 		wchar_t b[16];
-		swprintf (b, 16, L"%d", static_cast<int> (std::lround (kMinDb + t * (kMaxDb - kMinDb))));
-		if (!editing)
-			text (b, 30, DWRITE_FONT_WEIGHT_LIGHT, cWhite, bx + bw - 44, by + 4.5f, kRight);
+		swprintf (b, 16, L"%d", quant (0, t));
+		if (!editing && rn && quant (0, t) == 0)
+			text (L"OFF", 28, DWRITE_FONT_WEIGHT_LIGHT, C (150, 150, 156), bx + bw / 2.f, by + 6.f, kCenter, 1.5f);
+		else if (!editing)
+		{
+			text (b, 30, DWRITE_FONT_WEIGHT_LIGHT, cWhite, bx + bw - 36, by + 4.5f, kRight);
+			if (rn)
+				text (L"%", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, bx + bw - 11, by + 21, kRight);
+		}
 		else
 		{
 			strokeRR (bx + 0.5f, by + 0.5f, bw - 1, kLcdH - 1, 8, C (255, 255, 255, 150), 1.5f);
-			const float right = bx + bw - 44;
+			const float right = bx + bw - 36;
 			float w = 0.f;
 			if (!editBuf.empty ())
 			{
@@ -764,39 +985,84 @@ private:
 				line (right + 2, by + 9, right + 2, by + kLcdH - 9, cWhite, 1.5f);
 		}
 
-		float kx = static_cast<float> (kTrackL + t * (kTrackR - kTrackL));
-		if (kx > kTrackL + 1)
+		const float kx = static_cast<float> (kTrackL + t * (kTrackR - kTrackL));
+		if (rn)
+		{
+			// live voice probability fills the groove; the knob is the gate threshold
+			const float pw = std::clamp (vadShown, 0.f, 1.f) * (kTrackR - kTrackL + 6);
+			if (pw > 2.f)
+			{
+				cur->FillRoundedRectangle (RR (kTrackL - 3, kTrackY - 2.5f, pw, 5, 2.5f), vgrad (gSlider, kTrackY - 3, kTrackY + 3));
+				fillRR (kTrackL - 3, kTrackY - 3, pw, 6, 3, C (255, 255, 255, 30));
+			}
+			const float thr = static_cast<float> (t);
+			const bool voice = vadShown >= (thr > 0.f ? thr : 0.5f);
+			const float sx = kTrackR + 4.f;
+			text (voice ? L"VOICE" : L"NO VOICE", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, voice ? cWhite : cDim, sx, kTrackY - 38.f, kRight, 1.4f);
+			solid->SetColor (voice ? cWhite : cDim);
+			cur->FillEllipse (D2D1::Ellipse (D2D1::Point2F (sx - (voice ? 56.f : 76.f), kTrackY - 31.f), 3.f, 3.f), solid.Get ());
+		}
+		else if (kx > kTrackL + 1)
 		{
 			fillRR (kTrackL - 3, kTrackY - 3, kx - kTrackL + 3, 6, 3, C (255, 255, 255, 34));
 			cur->FillRoundedRectangle (RR (kTrackL - 3, kTrackY - 2.5f, kx - kTrackL + 3, 5, 2.5f), vgrad (gSlider, kTrackY - 3, kTrackY + 3));
 		}
-		// ticks + labels
-		for (int i = 0; i <= 30; ++i)
+		// ticks
+		const int nt = rn ? 20 : 30, per = rn ? 5 : 5;
+		for (int i = 0; i <= nt; ++i)
 		{
-			float x = std::floor (kTrackL + (kTrackR - kTrackL) * i / 30.f) + 0.5f;
-			bool major = i % 5 == 0, lit = x <= kx + 0.5f;
-			line (x, kTrackY + 16.f, x, kTrackY + (major ? 26.f : 21.f), lit ? C (220, 220, 225) : cDim);
+			float x = std::floor (kTrackL + (kTrackR - kTrackL) * i / float (nt)) + 0.5f;
+			bool major = i % per == 0, lit = x <= kx + 0.5f;
+			line (x, kTrackY + 16.f, x, kTrackY + (major ? 22.f : 19.f), lit ? C (220, 220, 225) : cDim);
 		}
-		// knob
-		for (int i = 4; i >= 1; --i)
-			fillRR (kx - 11 - i, kTrackY - 19 + i + 3, 22 + 2 * i, 38, 9 + i, C (0, 0, 0, 22));
-		Grad kg = (dragging || hoverSlider) ? gKnobHot : gKnob;
-		cur->FillRoundedRectangle (RR (kx - 11, kTrackY - 20, 22, 40, 9), vgrad (kg, kTrackY - 20, kTrackY + 20));
-		strokeRR (kx - 10.5f, kTrackY - 19.5f, 21, 39, 8.5f, C (14, 14, 16), 1.f);
-		line (kx - 6, kTrackY - 18, kx + 6, kTrackY - 18, C (255, 255, 255, 150));
-		for (float gx : {-4.f, 0.f, 4.f})
-			line (kx + gx, kTrackY - 9, kx + gx, kTrackY + 9, C (58, 58, 64), 1.5f);
+		// knob (smaller than before)
+		drawCapsule (kx, kTrackY, 18.f, 34.f, (dragging && dragTarget == 0) || hoverSlider, 3);
+
+		if (rn) // grace period slider: same look as the main one, a bit smaller
+		{
+			const float g = static_cast<float> (graceNorm ());
+			const float gx = kGrL + g * (kGrR - kGrL);
+			fillRR (kGrL - 5, kGrY - 5, kGrR - kGrL + 10, 10, 5, C (6, 6, 7));
+			strokeRR (kGrL - 4.5f, kGrY - 4.5f, kGrR - kGrL + 9, 9, 4.5f, C (66, 66, 72), 1.f);
+			line (kGrL, kGrY - 3.5f, kGrR, kGrY - 3.5f, C (0, 0, 0, 160));
+			if (gx > kGrL + 1)
+			{
+				fillRR (kGrL - 3, kGrY - 3, gx - kGrL + 3, 6, 3, C (255, 255, 255, 34));
+				cur->FillRoundedRectangle (RR (kGrL - 3, kGrY - 2.5f, gx - kGrL + 3, 5, 2.5f), vgrad (gSlider, kGrY - 3, kGrY + 3));
+			}
+			for (int i = 0; i <= 10; ++i)
+			{
+				const float x = std::floor (kGrL + (kGrR - kGrL) * i / 10.f) + 0.5f;
+				const bool major = i % 5 == 0, lit = x <= gx + 0.5f;
+				line (x, kGrY + 14.f, x, kGrY + (major ? 20.f : 17.f), lit ? C (220, 220, 225) : cDim);
+			}
+			drawCapsule (gx, kGrY, 14.f, 26.f, dragging && dragTarget == 1, 2);
+			wchar_t gb[16];
+			swprintf (gb, 16, L"%d ms", quant (1, g));
+			text (gb, 11, DWRITE_FONT_WEIGHT_NORMAL, cText, kGrR + 6.f, kGrLabelY - 1.f, kRight);
+		}
+
+		// "i" icons
+		for (int i = 0; i < infoCount (); ++i)
+		{
+			float ix, iy;
+			infoPos (i, ix, iy);
+			const bool h = hoverInfo == i;
+			solid->SetColor (h ? cWhite : C (130, 130, 136));
+			cur->DrawEllipse (D2D1::Ellipse (D2D1::Point2F (ix, iy), 7.f, 7.f), solid.Get (), 1.3f);
+			text (L"i", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, h ? cWhite : C (150, 150, 156), ix, iy - 7.8f, kCenter);
+		}
 	}
 
 	void drawAbout ()
 	{
 		strokeRR (kW / 2.f - 34, 96, 68, 68, 16, C (205, 205, 210), 3.f);
-		text (L"el", 38, DWRITE_FONT_WEIGHT_SEMI_BOLD, C (225, 225, 230), kW / 2.f, 107, kCenter);
-		text (L"Speex Noise Suppression", 24, DWRITE_FONT_WEIGHT_SEMI_BOLD, cWhite, kW / 2.f, 186, kCenter, 0.6f);
-		text (L"VST3  |  version 1.1.0", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, kW / 2.f, 222, kCenter, 0.4f);
+		text (L"el", 40, DWRITE_FONT_WEIGHT_NORMAL, C (225, 225, 230), kW / 2.f, 103, kCenter, 0.f, true);
+		text (L"elNoise", 38, DWRITE_FONT_WEIGHT_NORMAL, cWhite, kW / 2.f, 174, kCenter, 0.5f, true);
+		text (L"VST3  |  version 1.2.0", 13, DWRITE_FONT_WEIGHT_NORMAL, cMuted, kW / 2.f, 222, kCenter, 0.4f);
 		line (kW / 2.f - 60, 262.5f, kW / 2.f + 60, 262.5f, C (255, 255, 255, 40));
 		text (L"MADE BY", 11, DWRITE_FONT_WEIGHT_SEMI_BOLD, cMuted, kW / 2.f, 282, kCenter, 2.5f);
-		text (L"elem3n7ary", 32, DWRITE_FONT_WEIGHT_SEMI_BOLD, cWhite, kW / 2.f, 300, kCenter, 0.5f);
+		text (L"elem3n7ary", 34, DWRITE_FONT_WEIGHT_NORMAL, cWhite, kW / 2.f, 295, kCenter, 0.5f, true);
 		text (L"Based on SpeexDSP (Xiph.Org, BSD license)", 12, DWRITE_FONT_WEIGHT_NORMAL, cMuted, kW / 2.f, 380, kCenter);
 	}
 
@@ -823,13 +1089,69 @@ private:
 		staticRT->GetBitmap (&staticBmp);
 		cur = rt.Get ();
 		staticTab = tab;
+		staticMethod = meth->load ();
+	}
+
+	// small wrapped text bubble above (anchorX, anchorY)
+	void drawTooltip (const wchar_t* txt, float anchorX, float anchorY)
+	{
+		ComPtr<IDWriteTextFormat> fmt;
+		dw->CreateTextFormat (fontFamily.c_str (), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+		                      DWRITE_FONT_STRETCH_NORMAL, 12.f, L"en-us", &fmt);
+		if (!fmt)
+			return;
+		fmt->SetWordWrapping (DWRITE_WORD_WRAPPING_WRAP);
+		ComPtr<IDWriteTextLayout> lay;
+		dw->CreateTextLayout (txt, static_cast<UINT32> (wcslen (txt)), fmt.Get (), 250.f, 200.f, &lay);
+		if (!lay)
+			return;
+		DWRITE_TEXT_METRICS m {};
+		lay->GetMetrics (&m);
+		const float bw = m.width + 22.f, bh = m.height + 18.f;
+		const float bx = std::clamp (anchorX - 20.f, 8.f, kW - bw - 8.f), by = anchorY - bh - 6.f;
+		for (int i = 4; i >= 1; --i)
+			fillRR (bx - i, by - i + 4, bw + 2 * i, bh + 2 * i, 10 + i, C (0, 0, 0, 30));
+		fillRR (bx, by, bw, bh, 10, C (30, 30, 33));
+		strokeRR (bx + 0.5f, by + 0.5f, bw - 1, bh - 1, 9.5f, C (96, 96, 102, 200), 1.f);
+		solid->SetColor (cText);
+		cur->DrawTextLayout (D2D1::Point2F (bx + 11.f, by + 9.f), lay.Get (), solid.Get (), D2D1_DRAW_TEXT_OPTIONS_NONE);
+	}
+
+	void drawMenu ()
+	{
+		const float h = 12 + 3 * kRowH;
+		for (int i = 4; i >= 1; --i)
+			fillRR (kMenuX - i, kMenuY - i + 4, kMenuW + 2 * i, h + 2 * i, 12 + i, C (0, 0, 0, 30));
+		fillRR (kMenuX, kMenuY, kMenuW, h, 12, C (30, 30, 33));
+		strokeRR (kMenuX + 0.5f, kMenuY + 0.5f, kMenuW - 1, h - 1, 11.5f, C (96, 96, 102, 200), 1.f);
+		strokeRR (kPillX + 0.5f, kPillY + 0.5f, kPillW - 1, kPillH - 1, kPillH / 2 - 0.5f, C (255, 255, 255, 120), 1.f);
+		const wchar_t* title[3] = {L"Speex", L"RNNoise", L"RNNoise Lite"};
+		const bool ok = rnnoiseOk ();
+		const wchar_t* sub[3] = {L"Light on CPU, classic suppression",
+		                         ok ? L"Best quality, uses more CPU" : L"Needs a 48 kHz session",
+		                         ok ? L"Nearly as good, lighter on CPU" : L"Needs a 48 kHz session"};
+		for (int i = 0; i < 3; ++i)
+		{
+			const float y = kMenuY + 6 + i * kRowH;
+			const bool enabled = i == 0 || ok;
+			if (enabled && hoverRow == i)
+				fillRR (kMenuX + 6, y + 2, kMenuW - 12, kRowH - 4, 8, C (255, 255, 255, 22));
+			text (title[i], 14, DWRITE_FONT_WEIGHT_SEMI_BOLD, enabled ? cWhite : C (110, 110, 116), kMenuX + 18, y + 6, kLeft, 0.3f);
+			text (sub[i], 11, DWRITE_FONT_WEIGHT_NORMAL, enabled ? cMuted : C (84, 84, 90), kMenuX + 18, y + 27, kLeft);
+			if (i == meth->load ())
+			{
+				const float cx = kMenuX + kMenuW - 22, cy = y + kRowH / 2;
+				line (cx - 4, cy, cx - 1, cy + 3, cWhite, 1.8f);
+				line (cx - 1, cy + 3, cx + 5, cy - 4, cWhite, 1.8f);
+			}
+		}
 	}
 
 	void render ()
 	{
 		if (!ensureTarget ())
 			return;
-		if (staticTab != tab || !staticBmp)
+		if (staticTab != tab || staticMethod != meth->load () || !staticBmp)
 			buildStatic ();
 		cur = rt.Get ();
 		rt->BeginDraw ();
@@ -841,6 +1163,14 @@ private:
 			drawDisplayDynamic ();
 			drawSliderDynamic ();
 		}
+		if (tab == 0 && hoverInfo >= 0 && hoverInfo < infoCount () && !menuOpen)
+		{
+			float ix, iy;
+			infoPos (hoverInfo, ix, iy);
+			drawTooltip (infoText (hoverInfo), ix, iy - 14.f);
+		}
+		if (menuOpen)
+			drawMenu ();
 		if (rt->EndDraw () == D2DERR_RECREATE_TARGET)
 		{
 			releaseTarget ();
@@ -850,6 +1180,7 @@ private:
 		std::copy (sOut, sOut + Analyzer::kBands, rOut);
 		rLvIn = lvIn;
 		rLvOut = lvOut;
+		rVad = vadShown;
 	}
 
 	// returns true when the spectrum / levels moved enough to be worth a redraw
@@ -874,7 +1205,8 @@ private:
 		lvl (lvIn, aIn->level ());
 		lvl (lvOut, aOut->level ());
 
-		float diff = std::fabs (lvIn - rLvIn) + std::fabs (lvOut - rLvOut);
+		vadShown = std::max (vprob->load (), vadShown * 0.88f);
+		float diff = std::fabs (lvIn - rLvIn) + std::fabs (lvOut - rLvOut) + (rnnMode () ? 40.f * std::fabs (vadShown - rVad) : 0.f);
 		for (int b = 0; b < Analyzer::kBands; ++b)
 			diff = std::max (diff, std::max (std::fabs (sIn[b] - rIn[b]), std::fabs (sOut[b] - rOut[b])));
 		return diff > 0.04f;
@@ -893,10 +1225,12 @@ private:
 			caretPhase = (GetTickCount () - caretT) / 530;
 			changed = true;
 		}
-		double cur = dbValue->load ();
-		if (std::fabs (cur - lastDb) > 1e-6)
+		double cur = dbValue->load (), thr = vthr->load (), gr = vgrace->load ();
+		if (std::fabs (cur - lastDb) > 1e-6 || std::fabs (thr - lastThr) > 1e-6 || std::fabs (gr - lastGrace) > 1e-6)
 		{
 			lastDb = cur;
+			lastThr = thr;
+			lastGrace = gr;
 			changed = true;
 		}
 		// the analyzer only needs 30 fps; interaction (dirty / dragging) gets the full display rate
@@ -945,6 +1279,28 @@ private:
 			{
 				if (!self)
 					return 0;
+				if (self->menuOpen)
+				{
+					int row = self->hitMenuRow (x, y);
+					const bool usable = row == 0 || (row > 0 && self->rnnoiseOk ());
+					if (usable)
+						self->chooseMethod (row);
+					if (usable || row < 0) // a disabled row keeps the menu open
+					{
+						self->menuOpen = false;
+						self->dirty = true;
+					}
+					return 0;
+				}
+				if (self->hitPill (x, y))
+				{
+					if (self->editing)
+						self->commitEdit ();
+					self->menuOpen = true;
+					self->hoverRow = -1;
+					self->dirty = true;
+					return 0;
+				}
 				if (self->editing && !self->hitLcd (x, y))
 					self->commitEdit ();
 				if (self->tab == 0 && self->hitLcd (x, y))
@@ -964,16 +1320,18 @@ private:
 					self->tab = t;
 					self->dirty = true;
 				}
-				else if (self->tab == 0 && self->onSlider (x, y))
+				else if (self->tab == 0 && (self->onSlider (x, y) || self->onGrace (x, y)))
 				{
+					const bool grace = self->onGrace (x, y);
+					self->dragTarget = grace ? 1 : 0;
 					self->dragging = true;
-					self->dragNorm = self->norm ();
-					self->lastSentDb = static_cast<int> (std::lround (self->dbValue->load ()));
+					self->dragNorm = self->normFor (self->dragTarget);
+					self->lastSentDb = self->quant (self->dragTarget, self->dragNorm);
 					self->lastX = x;
 					SetCapture (h);
-					self->ctrl->beginEdit (kSuppression);
+					self->ctrl->beginEdit (self->dragParam ());
 					if (!(GetKeyState (VK_SHIFT) & 0x8000))
-						self->setNorm ((x - kTrackL) / double (kTrackR - kTrackL));
+						self->setNorm ((x - (grace ? kGrL : kTrackL)) / double (grace ? kGrR - kGrL : kTrackR - kTrackL));
 				}
 				return 0;
 			}
@@ -982,11 +1340,21 @@ private:
 					return 0;
 				if (self->dragging)
 				{
+					const double l = self->dragTarget == 1 ? kGrL : kTrackL, w = self->dragTarget == 1 ? kGrR - kGrL : kTrackR - kTrackL;
 					if (GetKeyState (VK_SHIFT) & 0x8000) // fine adjust: 5x slower, relative
-						self->setNorm (self->curNorm () + (x - self->lastX) / (5.0 * (kTrackR - kTrackL)));
+						self->setNorm (self->dragNorm + (x - self->lastX) / (5.0 * w));
 					else
-						self->setNorm ((x - kTrackL) / double (kTrackR - kTrackL));
+						self->setNorm ((x - l) / w);
 					self->lastX = x;
+				}
+				else if (self->menuOpen)
+				{
+					int row = self->hitMenuRow (x, y);
+					if (row != self->hoverRow)
+					{
+						self->hoverRow = row;
+						self->dirty = true;
+					}
 				}
 				else
 				{
@@ -996,14 +1364,21 @@ private:
 						self->hoverSlider = hv;
 						self->dirty = true;
 					}
+					int hi = self->hitInfoIdx (x, y);
+					if (hi != self->hoverInfo)
+					{
+						self->hoverInfo = hi;
+						self->dirty = true;
+					}
 					TRACKMOUSEEVENT te {sizeof (te), TME_LEAVE, h, 0};
 					TrackMouseEvent (&te);
 				}
 				return 0;
 			case WM_MOUSELEAVE:
-				if (self && self->hoverSlider)
+				if (self && (self->hoverSlider || self->hoverInfo >= 0))
 				{
 					self->hoverSlider = false;
+					self->hoverInfo = -1;
 					self->dirty = true;
 				}
 				return 0;
@@ -1039,8 +1414,10 @@ private:
 				POINT pt;
 				GetCursorPos (&pt);
 				ScreenToClient (h, &pt);
-				bool hand = self && (self->hitTab (pt.x, pt.y) >= 0 || (self->tab == 0 && (self->dragging || self->onSlider (pt.x, pt.y))));
-				bool ibeam = self && self->tab == 0 && self->hitLcd (pt.x, pt.y);
+				bool hand = self && (self->hitTab (pt.x, pt.y) >= 0 || (self->tab == 0 && (self->dragging || self->onSlider (pt.x, pt.y) || self->onGrace (pt.x, pt.y))));
+				if (self && (self->hitPill (pt.x, pt.y) || (self->menuOpen && (self->hitMenuRow (pt.x, pt.y) == 0 || (self->hitMenuRow (pt.x, pt.y) > 0 && self->rnnoiseOk ())))))
+					hand = true;
+				bool ibeam = self && self->tab == 0 && !self->menuOpen && self->hitLcd (pt.x, pt.y);
 				if (self && self->tab == 0 && self->hitBypass (pt.x, pt.y))
 					hand = true;
 				SetCursor (LoadCursor (nullptr, ibeam ? IDC_IBEAM : (hand ? IDC_HAND : IDC_ARROW)));
@@ -1051,19 +1428,20 @@ private:
 				{
 					self->dragging = false;
 					ReleaseCapture ();
-					self->ctrl->setParamNormalized (kSuppression, self->dragNorm);
-					self->ctrl->performEdit (kSuppression, self->dragNorm);
-					self->ctrl->endEdit (kSuppression);
+					const ParamID pid = self->dragParam ();
+					self->ctrl->setParamNormalized (pid, self->dragNorm);
+					self->ctrl->performEdit (pid, self->dragNorm);
+					self->ctrl->endEdit (pid);
 					self->dirty = true;
 				}
 				return 0;
 			case WM_MOUSEWHEEL:
 				if (self && self->tab == 0)
 				{
-					double step = (GET_WHEEL_DELTA_WPARAM (wp) / 120.0) / (kMaxDb - kMinDb);
-					self->ctrl->beginEdit (kSuppression);
+					double step = (GET_WHEEL_DELTA_WPARAM (wp) / 120.0) / self->mainRange ();
+					self->ctrl->beginEdit (self->mainParam ());
 					self->setNorm (self->norm () + step);
-					self->ctrl->endEdit (kSuppression);
+					self->ctrl->endEdit (self->mainParam ());
 				}
 				return 0;
 		}
@@ -1073,13 +1451,21 @@ private:
 	EditController* ctrl;
 	std::atomic<double>* dbValue;
 	std::atomic<bool>* byp;
+	std::atomic<int>* meth;
+	const std::atomic<double>* rate;
+	std::atomic<double>*vthr, *vgrace;
+	const std::atomic<float>* vprob;
 	Analyzer *aIn, *aOut;
 	HWND hwnd = nullptr;
 	std::thread ticker;
 	std::atomic<bool> running {false}, pending {false};
 	bool dragging = false, dirty = true, hoverSlider = false;
 	int tab = 0, lastX = 0, lastSentDb = 0, skip = 0;
-	bool editing = false, editFresh = false;
+	bool editing = false, editFresh = false, menuOpen = false;
+	int hoverInfo = -1; // which "i" icon the mouse is over
+	int hoverRow = -1, dragTarget = 0; // 0 = main slider, 1 = grace slider
+	float vadShown = 0.f, rVad = 0.f;
+	double lastThr = 1e9, lastGrace = 1e9;
 	DWORD caretPhase = 0;
 	std::wstring editBuf;
 	DWORD caretT = 0;
@@ -1089,11 +1475,15 @@ private:
 
 	ComPtr<ID2D1Factory> d2d;
 	ComPtr<IDWriteFactory> dw;
+	ComPtr<IDWriteFactory5> dw5;
+	ComPtr<IDWriteInMemoryFontFileLoader> memLoader;
+	ComPtr<IDWriteFontCollection1> brandColl;
+	std::wstring brandFamily;
 	ComPtr<ID2D1HwndRenderTarget> rt;
 	ComPtr<ID2D1BitmapRenderTarget> staticRT;
 	ComPtr<ID2D1Bitmap> staticBmp;
 	ID2D1RenderTarget* cur = nullptr;
-	int staticTab = -1;
+	int staticTab = -1, staticMethod = -1;
 	ComPtr<ID2D1SolidColorBrush> solid;
 	ComPtr<ID2D1LinearGradientBrush> grad[kGrads];
 	std::wstring fontFamily;
@@ -1108,7 +1498,7 @@ public:
 	IPlugView* PLUGIN_API createView (FIDString name) SMTG_OVERRIDE
 	{
 		if (FIDStringsEqual (name, ViewType::kEditor))
-			return new SpeexView (this, &suppressDb, &bypassed, &inAnalyzer, &outAnalyzer);
+			return new SpeexView (this, &suppressDb, &bypassed, &method, &sampleRate, &vadThr, &vadGrace, &vadProb, &inAnalyzer, &outAnalyzer);
 		return nullptr;
 	}
 
@@ -1127,6 +1517,17 @@ public:
 		parameters.addParameter (p);
 		parameters.addParameter (new Parameter (STR16 ("Bypass"), kBypass, nullptr, 0., 1,
 		                                        ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass));
+		auto* m = new StringListParameter (STR16 ("Method"), kMethod);
+		m->appendString (STR16 ("Speex"));
+		m->appendString (STR16 ("RNNoise"));
+		m->appendString (STR16 ("RNNoise Lite"));
+		parameters.addParameter (m);
+		auto* vt = new RangeParameter (STR16 ("VAD Threshold"), kVadThreshold, STR16 ("%"), 0., 100., 0., 0, ParameterInfo::kCanAutomate);
+		vt->setPrecision (0);
+		parameters.addParameter (vt);
+		auto* vg = new RangeParameter (STR16 ("VAD Grace Period"), kVadGrace, STR16 ("ms"), 0., 500., 200., 0, ParameterInfo::kCanAutomate);
+		vg->setPrecision (0);
+		parameters.addParameter (vg);
 		return kResultOk;
 	}
 
@@ -1192,10 +1593,11 @@ public:
 					if (q->getPoint (q->getPointCount () - 1, off, v) == kResultTrue)
 						setNormalized (v);
 				}
-				else if (q->getParameterId () == kBypass)
+				else if (q->getParameterId () == kBypass || q->getParameterId () == kMethod ||
+				         q->getParameterId () == kVadThreshold || q->getParameterId () == kVadGrace)
 				{
 					if (q->getPoint (q->getPointCount () - 1, off, v) == kResultTrue)
-						setParamNormalized (kBypass, v);
+						setParamNormalized (q->getParameterId (), v);
 				}
 			}
 		}
@@ -1211,6 +1613,10 @@ public:
 
 		const float bypassTarget = bypassed.load () ? 1.f : 0.f;
 		int level = static_cast<int> (std::lround (suppressDb.load ()));
+		const int meth = method.load ();
+		const bool useRn = meth >= 1 && frame == 480 && std::fabs (sampleRate.load ()- 48000.0) < 1.0;
+		const float vadThrNow = static_cast<float> (vadThr.load ()) / 100.f;
+		const int graceFrames = static_cast<int> (std::ceil (vadGrace.load () / 10.0));
 		for (int32 c = 0; c < chans; ++c)
 		{
 			Chan& ch = states[c];
@@ -1224,10 +1630,23 @@ public:
 			for (int32 i = 0; i < data.numSamples; ++i)
 			{
 				float x = std::clamp (src[i], -1.f, 1.f);
-				ch.inQ[ch.fill] = static_cast<spx_int16_t> (std::lround (x * 32767.f));
-				float voice = ch.outQ[ch.fill] * (1.f / 32768.f);
+					ch.inQ[ch.fill] = static_cast<spx_int16_t> (std::lround (x * 32767.f));
+				ch.inF[ch.fill] = x * 32768.f;
 				float dry = ch.dry[ch.fill]; // input delayed by the same 10 ms, so bypass keeps the latency
 				ch.dry[ch.fill] = x;
+				float voice;
+				ch.gate += (ch.gateTarget - ch.gate) * 0.02f; // voice gate, smoothed (~1 ms)
+				if (useRn)
+					voice = ch.outF[ch.fill] * (1.f / 32768.f) * ch.gate;
+				else
+					voice = ch.outQ[ch.fill] * (1.f / 32768.f);
+				if (std::fabs (voice) < 4e-5f) // never output digital silence: some apps treat it as "mic dead"
+				{
+					ch.rng = ch.rng * 1664525u + 1013904223u;
+					uint32_t r1 = ch.rng >> 8;
+					ch.rng = ch.rng * 1664525u + 1013904223u;
+					voice += (static_cast<float> (r1) - static_cast<float> (ch.rng >> 8)) * (1e-4f / 16777216.f);
+				}
 				ch.gb += (bypassTarget - ch.gb) * 0.01f; // short crossfade, no clicks
 				dst[i] = voice + (dry - voice) * ch.gb;
 				if (c == 0)
@@ -1237,8 +1656,34 @@ public:
 				}
 				if (++ch.fill == frame)
 				{
-					speex_preprocess_run (ch.st, ch.inQ.data ());
-					ch.outQ = ch.inQ;
+					if (useRn)
+					{
+						float p = rnnoise_process_frame (meth == 2 ? ch.rnL : ch.rn, ch.outF.data (), ch.inF.data ());
+						if (vadThrNow <= 0.001f)
+						{
+							ch.hold = 0;
+							ch.gateTarget = 1.f;
+						}
+						else if (p >= vadThrNow)
+						{
+							ch.hold = graceFrames;
+							ch.gateTarget = 1.f;
+						}
+						else if (ch.hold > 0)
+						{
+							--ch.hold;
+							ch.gateTarget = 1.f;
+						}
+						else
+							ch.gateTarget = 0.f;
+						if (c == 0)
+							vadProb.store (p, std::memory_order_relaxed);
+					}
+					else
+					{
+						speex_preprocess_run (ch.st, ch.inQ.data ());
+						ch.outQ = ch.inQ;
+					}
 					ch.fill = 0;
 				}
 			}
@@ -1256,6 +1701,13 @@ public:
 		int32 b;
 		if (r.readInt32 (b))
 			setParamNormalized (kBypass, b ? 1.0 : 0.0);
+		if (r.readInt32 (b))
+			setParamNormalized (kMethod, std::clamp (b, 0, 2) / 2.0);
+		double d;
+		if (r.readDouble (d))
+			setParamNormalized (kVadThreshold, std::clamp (d, 0.0, 100.0) / 100.0);
+		if (r.readDouble (d))
+			setParamNormalized (kVadGrace, std::clamp (d, 0.0, 500.0) / 500.0);
 		return kResultOk;
 	}
 
@@ -1264,6 +1716,9 @@ public:
 		IBStreamer w (s, kLittleEndian);
 		w.writeDouble (suppressDb.load ());
 		w.writeInt32 (bypassed.load () ? 1 : 0);
+		w.writeInt32 (method.load ());
+		w.writeDouble (vadThr.load ());
+		w.writeDouble (vadGrace.load ());
 		return kResultOk;
 	}
 
@@ -1273,6 +1728,12 @@ public:
 			suppressDb = kMinDb + v * (kMaxDb - kMinDb);
 		else if (id == kBypass)
 			bypassed = v > 0.5;
+		else if (id == kMethod)
+			method = std::clamp (static_cast<int> (std::lround (v * 2.0)), 0, 2);
+		else if (id == kVadThreshold)
+			vadThr = v * 100.0;
+		else if (id == kVadGrace)
+			vadGrace = v * 500.0;
 		return SingleComponentEffect::setParamNormalized (id, v);
 	}
 
@@ -1280,8 +1741,12 @@ private:
 	struct Chan
 	{
 		SpeexPreprocessState* st = nullptr;
+		DenoiseState *rn = nullptr, *rnL = nullptr;
+		float gate = 1.f, gateTarget = 1.f;
+		int hold = 0;
 		std::vector<spx_int16_t> inQ, outQ;
-		std::vector<float> dry;
+		std::vector<float> inF, outF, dry;
+		uint32_t rng = 12345u;
 		float gb = 0.f;
 		int fill = 0;
 		int appliedLevel = 1;
@@ -1305,8 +1770,13 @@ private:
 			speex_preprocess_ctl (ch.st, SPEEX_PREPROCESS_SET_DENOISE, &on);
 			speex_preprocess_ctl (ch.st, SPEEX_PREPROCESS_SET_AGC, &off);
 			speex_preprocess_ctl (ch.st, SPEEX_PREPROCESS_SET_DEREVERB, &off);
+			ch.rn = rnnoise_create (nullptr);
+			ch.rnL = elnoise_create_light ();
+			ch.rng = 12345u + static_cast<uint32_t> (&ch - states.data ()) * 7919u;
 			ch.inQ.assign (frame, 0);
 			ch.outQ.assign (frame, 0);
+			ch.inF.assign (frame, 0.f);
+			ch.outF.assign (frame, 0.f);
 			ch.dry.assign (frame, 0.f);
 			ch.gb = bypassed.load () ? 1.f : 0.f;
 		}
@@ -1315,8 +1785,14 @@ private:
 	void destroyStates ()
 	{
 		for (auto& ch : states)
+		{
 			if (ch.st)
 				speex_preprocess_state_destroy (ch.st);
+			if (ch.rn)
+				rnnoise_destroy (ch.rn);
+			if (ch.rnL)
+				rnnoise_destroy (ch.rnL);
+		}
 		states.clear ();
 	}
 
@@ -1324,13 +1800,16 @@ private:
 	std::vector<Chan> states;
 	std::atomic<double> suppressDb {kDefaultDb};
 	std::atomic<bool> bypassed {false};
-	double sampleRate = 48000.0;
+	std::atomic<int> method {0};
+	std::atomic<double> vadThr {0.0}, vadGrace {200.0};
+	std::atomic<float> vadProb {0.f};
+	std::atomic<double> sampleRate {48000.0};
 	int frame = 480;
 };
 
-BEGIN_FACTORY_DEF ("Speex NS", "", "")
+BEGIN_FACTORY_DEF ("elem3n7ary", "https://github.com/elem3n7ary/elnoise", "")
 	DEF_CLASS2 (INLINE_UID_FROM_FUID (kPluginUID), PClassInfo::kManyInstances, kVstAudioEffectClass,
-	            "Speex Noise Suppression", Vst::kSimpleModeSupported, Vst::PlugType::kFxRestoration, "1.1.0",
+	            "elNoise", Vst::kSimpleModeSupported, Vst::PlugType::kFxRestoration, "1.2.0",
 	            kVstVersionString, SpeexNoiseSuppression::create)
 END_FACTORY
 

@@ -26,9 +26,9 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $name = "SpeexNoiseSuppression-${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}-win64"
+          $name = "elNoise-${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}-win64"
           New-Item -ItemType Directory pack | Out-Null
-          Copy-Item build/VST3/Release/SpeexNoiseSuppression.vst3 pack -Recurse
+          Copy-Item build/VST3/Release/elNoise.vst3 pack -Recurse
           Copy-Item LICENSE, README.md pack
           Copy-Item THIRD_PARTY_LICENSES pack -Recurse
           Compress-Archive -Path pack/* -DestinationPath "$name.zip"
@@ -38,7 +38,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: SpeexNoiseSuppression-win64
+          name: elNoise-win64
           path: |
             ${{ env.ZIP_NAME }}
             SHA256SUMS.txt

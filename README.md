@@ -1,13 +1,13 @@
 # elNoise: AI microphone noise suppression (VST3 for Windows)
 
 **Remove keyboard, fan and background noise from your mic in real time. RNNoise (neural network) and Speex in one
-lightweight VST3 plugin for Elgato Wave Link, OBS, Discord and any other VST3 host.**
+lightweight VST3 plugin for Elgato Wave Link, any VST3 host and the apps behind it (Discord, games, streams).**
 
 ![elNoise](docs/screenshot.png)
 
 ## Why
 
-OBS has built-in noise suppression (Speex and RNNoise), but only inside OBS. elNoise puts the same engines, plus the
+OBS has built-in noise suppression (Speex and RNNoise), but only inside OBS (and OBS itself loads only VST 2 plugins, not VST3). elNoise puts the same engines, plus the
 newest RNNoise v0.2 models, into a VST3 you can use anywhere, for example as a microphone effect in **Elgato Wave Link**,
 so you get the same clean mic in calls, Discord, streams and games. It is free, open source and small enough for weak PCs.
 

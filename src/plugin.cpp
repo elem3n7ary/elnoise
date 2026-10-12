@@ -1167,7 +1167,7 @@ private:
 				fillRR (px, py, pw, ph, ph / 2, optOpen ? C (40, 40, 44) : C (22, 22, 24));
 			strokeRR (px + 0.5f, py + 0.5f, pw - 1, ph - 1, ph / 2 - 0.5f, on ? C (255, 255, 255, 90) : C (84, 84, 90, 170));
 			const Clr fg = on ? C (24, 24, 26) : (optOpen ? cText : cMuted);
-			text (on ? L"BYPASSED" : L"OPTIONS", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, fg, px + 33.f, py + ph / 2 - 6.5f, kCenter, 1.2f);
+			text (on ? L"BYPASSED" : L"OPTIONS", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, fg, px + 38.f, py + ph / 2 - 6.5f, kCenter, 1.2f); // centred between the left edge and the chevron
 			// chevron
 			const float cx = px + pw - 15.f, cy = py + ph / 2 + (optOpen == rn ? 1.f : -1.f) * 0.f;
 			const float d = optOpen != rn ? 2.2f : -2.2f; // points toward the direction the panel opens/closes

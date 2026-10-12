@@ -28,6 +28,8 @@
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "public.sdk/source/common/memorystream.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
+#include "public.sdk/source/vst/hosting/hostclasses.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -44,7 +46,7 @@ static void check (bool ok, const char* name, const char* fmt = "", double a = 0
 static IPluginFactory* g_factory = nullptr;
 static TUID g_cid;
 
-enum { kMethod = 98, kBypass = 99, kSuppression = 100, kVadThr = 101, kVadGrace = 102 };
+enum { kMethod = 98, kBypass = 99, kSuppression = 100, kVadThr = 101, kVadGrace = 102, kMono = 103, kEco = 104 };
 
 struct Plugin
 {
@@ -204,7 +206,7 @@ static void testFactoryAndParams ()
 
 	Plugin p;
 	check (p.create (48000, 2), "plugin instance created", "");
-	check (p.ctrl->getParameterCount () == 5, "5 parameters", "(got %.0f)", p.ctrl->getParameterCount ());
+	check (p.ctrl->getParameterCount () == 7, "7 parameters", "(got %.0f)", p.ctrl->getParameterCount ());
 	struct Exp { ParamID id; double def; const char* what; };
 	const Exp exp[] = {{kMethod, 0.0, "method default = Speex"}, {kBypass, 0.0, "bypass default = off"},
 	                   {kSuppression, 0.5, "suppression default = -30 dB"}, {kVadThr, 0.0, "VAD threshold default = 0 (off)"},
@@ -225,7 +227,7 @@ static void testFactoryAndParams ()
 			methodSteps = pi.stepCount;
 		autoAll = autoAll && (pi.flags & ParameterInfo::kCanAutomate);
 	}
-	check (bypassFlag, "bypass parameter carries the kIsBypass flag", "");
+	check (!bypassFlag, "our Bypass is not the host bypass (host disable must stay authoritative)", "");
 	check (methodSteps == 2, "method has 3 entries (stepCount 2)", "(got %.0f)", methodSteps);
 	check (autoAll, "all parameters are automatable", "");
 	check (p.proc->getLatencySamples () == 480, "reported latency = 480 samples (10 ms at 48 kHz)", "(got %.0f)", p.proc->getLatencySamples ());
@@ -239,18 +241,18 @@ static void testState ()
 	printf("\n[2] state save / load\n");
 	Plugin a, b;
 	a.create (48000, 2);
-	a.set (kMethod, mnorm (2)); a.set (kBypass, 1.0); a.set (kSuppression, 0.25); a.set (kVadThr, 0.6); a.set (kVadGrace, 0.3);
+	a.set (kMethod, mnorm (2)); a.set (kBypass, 1.0); a.set (kSuppression, 0.25); a.set (kVadThr, 0.6); a.set (kVadGrace, 0.3); a.set (kMono, 1.0); a.set (kEco, 1.0);
 	MemoryStream ms;
 	check (a.comp->getState (&ms) == kResultOk, "getState ok", "");
 	b.create (48000, 2);
 	int64 pos;
 	ms.seek (0, IBStream::kIBSeekSet, &pos);
 	check (b.comp->setState (&ms) == kResultOk, "setState ok", "");
-	const ParamID ids[] = {kMethod, kBypass, kSuppression, kVadThr, kVadGrace};
+	const ParamID ids[] = {kMethod, kBypass, kSuppression, kVadThr, kVadGrace, kMono, kEco};
 	bool same = true;
 	for (ParamID id : ids)
 		same = same && std::fabs (a.get (id) - b.get (id)) < 1e-9;
-	check (same, "all 5 parameters restored exactly", "");
+	check (same, "all 7 parameters restored exactly", "");
 	// an old-style state with only the suppression value must still load
 	MemoryStream old;
 	double d = -12.0;
@@ -728,6 +730,116 @@ static void testScaling ()
 	p.destroy ();
 }
 
+
+// stereo run with different signals on L and R
+static std::vector<std::vector<float>> runLR (Plugin& p, const std::vector<float>& l, const std::vector<float>& r, int block,
+                                              const std::function<void (int)>& hook = nullptr)
+{
+	const int n = static_cast<int> (l.size ());
+	std::vector<std::vector<float>> out (2, std::vector<float> (n, 0.f));
+	std::vector<float> ib (2 * block), ob (2 * block);
+	int bi = 0;
+	for (int pos = 0; pos < n; pos += block, ++bi)
+	{
+		const int m = std::min (block, n - pos);
+		float* in[2] = {&ib[0], &ib[block]};
+		float* ou[2] = {&ob[0], &ob[block]};
+		for (int i = 0; i < m; ++i)
+		{
+			in[0][i] = l[pos + i];
+			in[1][i] = r[pos + i];
+		}
+		if (hook)
+			hook (bi);
+		p.process (in, ou, m);
+		for (int c = 0; c < 2; ++c)
+			for (int i = 0; i < m; ++i)
+				out[c][pos + i] = ou[c][i];
+	}
+	return out;
+}
+
+static void testMonoEco ()
+{
+	printf ("\n[14] mono mode and eco mode\n");
+	const int n = 48000 * 4;
+	auto l = makeSignal (n, 48000, 0.01, true, 3);
+	auto r = makeSignal (n, 48000, 0.01, true, 99);
+	for (int m = 0; m < 3; ++m)
+	{
+		char nm[120];
+		Plugin p;
+		p.create (48000, 2);
+		p.set (kMethod, mnorm (m));
+		p.set (kMono, 1.0);
+		auto o = runLR (p, l, r, 480);
+		double maxDiff = 0;
+		for (int i = 24000; i < n; ++i)
+			maxDiff = std::max (maxDiff, double (std::fabs (o[0][i] - o[1][i])));
+		snprintf (nm, sizeof nm, "%s: mono output is identical on L and R", kMethodNames[m]);
+		check (maxDiff == 0.0, nm, "(max diff %.3g)", maxDiff);
+		snprintf (nm, sizeof nm, "%s: mono output is finite and not silent", kMethodNames[m]);
+		check (allFinite (o[0]) && rmsDb (o[0], 24000, n) > -80, nm, "(%.1f dB)", rmsDb (o[0], 24000, n));
+		p.destroy ();
+
+		// mono must equal the normal engine fed with the mix (identical input on both channels)
+		std::vector<float> mix (n);
+		for (int i = 0; i < n; ++i)
+			mix[i] = 0.5f * (l[i] + r[i]);
+		Plugin a, b;
+		a.create (48000, 2);
+		b.create (48000, 2);
+		a.set (kMethod, mnorm (m));
+		b.set (kMethod, mnorm (m));
+		a.set (kMono, 1.0);
+		auto oa = runLR (a, l, r, 480);
+		auto ob = runLR (b, mix, mix, 480);
+		double e = 0;
+		for (int i = 24000; i < n; ++i)
+			e = std::max (e, double (std::fabs (oa[0][i] - ob[0][i])));
+		snprintf (nm, sizeof nm, "%s: mono == engine fed with (L+R)/2", kMethodNames[m]);
+		check (e < 1e-6, nm, "(max diff %.3g)", e);
+		a.destroy ();
+		b.destroy ();
+
+		// switching mono on and off, and bypass on and off, in the middle of audio: nothing explodes or clicks
+		Plugin t;
+		t.create (48000, 2);
+		t.set (kMethod, mnorm (m));
+		auto ot = runLR (t, l, r, 480, [&] (int bi) {
+			if (bi % 37 == 0) t.set (kMono, (bi / 37) & 1 ? 1.0 : 0.0);
+			if (bi % 53 == 0) t.set (kBypass, (bi / 53) & 1 ? 1.0 : 0.0);
+		});
+		double peak = 0;
+		for (int c = 0; c < 2; ++c)
+			for (float v : ot[c])
+				peak = std::max (peak, double (std::fabs (v)));
+		snprintf (nm, sizeof nm, "%s: toggling mono/bypass during audio stays finite and in range", kMethodNames[m]);
+		check (allFinite (ot[0]) && allFinite (ot[1]) && peak < 1.2, nm, "(peak %.3f)", peak);
+		t.destroy ();
+	}
+	// mono costs about half
+	{
+		Plugin st, mo;
+		st.create (48000, 2);
+		mo.create (48000, 2);
+		st.set (kMethod, mnorm (1));
+		st.set (kMono, 0.0);
+		mo.set (kMethod, mnorm (1));
+		mo.set (kMono, 1.0);
+		auto time = [&] (Plugin& p) {
+			auto t0 = std::chrono::steady_clock::now ();
+			runLR (p, l, r, 480);
+			return std::chrono::duration<double> (std::chrono::steady_clock::now () - t0).count ();
+		};
+		time (st); time (mo); // warm up
+		const double ts = time (st), tm = time (mo);
+		check (tm < ts * 0.75, "RNNoise: mono needs clearly less CPU than stereo", "(stereo %.0f ms, mono %.0f ms)", ts * 1000, tm * 1000);
+		st.destroy ();
+		mo.destroy ();
+	}
+}
+
 static void testInstancesAndLifecycle ()
 {
 	printf ("\n[13] many instances, activate/deactivate cycles\n");
@@ -764,8 +876,103 @@ static void testInstancesAndLifecycle ()
 	check (cyc, "25x setActive / setupProcessing (alternating 44.1/48 kHz) cycles", "");
 }
 
+// inspect <vst3>: lists what any plugin tells a host through the public VST3 interfaces (no audio is processed)
+static int inspectPlugin (const wchar_t* path)
+{
+	HMODULE mod = LoadLibraryW (path);
+	if (!mod)
+	{
+		printf ("cannot load\n");
+		return 2;
+	}
+	if (auto initDll = reinterpret_cast<bool (*) ()> (GetProcAddress (mod, "InitDll")))
+		initDll ();
+	auto getFactory = reinterpret_cast<IPluginFactory* (*) ()> (GetProcAddress (mod, "GetPluginFactory"));
+	IPluginFactory* f = getFactory ();
+	PFactoryInfo fi;
+	f->getFactoryInfo (&fi);
+	printf ("factory: vendor='%s' url='%s'\n", fi.vendor, fi.url);
+	HostApplication host;
+	auto s16 = [] (const TChar* t) {
+		std::string o;
+		for (; *t; ++t) o += static_cast<char> (*t < 128 ? *t : '?');
+		return o;
+	};
+	for (int i = 0; i < f->countClasses (); ++i)
+	{
+		PClassInfo ci;
+		f->getClassInfo (i, &ci);
+		printf ("class %d: '%s' category='%s'\n", i, ci.name, ci.category);
+		if (std::string (ci.category) != "Audio Module Class")
+			continue;
+		IComponent* comp = nullptr;
+		if (f->createInstance (ci.cid, IComponent::iid, reinterpret_cast<void**> (&comp)) != kResultOk || !comp)
+			continue;
+		comp->initialize (&host);
+		IAudioProcessor* proc = nullptr;
+		comp->queryInterface (IAudioProcessor::iid, reinterpret_cast<void**> (&proc));
+		IEditController* ctrl = nullptr;
+		if (comp->queryInterface (IEditController::iid, reinterpret_cast<void**> (&ctrl)) != kResultOk || !ctrl)
+		{
+			TUID cc;
+			if (comp->getControllerClassId (cc) == kResultOk)
+			{
+				f->createInstance (cc, IEditController::iid, reinterpret_cast<void**> (&ctrl));
+				if (ctrl) ctrl->initialize (&host);
+				printf ("  separate controller component\n");
+			}
+		}
+		else
+			printf ("  single-component effect (controller in the same object)\n");
+		for (int dir = 0; dir < 2; ++dir)
+			for (int b = 0; b < comp->getBusCount (kAudio, dir); ++b)
+			{
+				BusInfo bi {};
+				comp->getBusInfo (kAudio, dir, b, bi);
+				printf ("  %s bus %d: '%s' channels=%d default-active=%d\n", dir ? "output" : "input", b, s16 (bi.name).c_str (), bi.channelCount, (bi.flags & BusInfo::kDefaultActive) ? 1 : 0);
+			}
+		if (proc)
+			printf ("  latency=%u samples, tail=%u samples, 32bit=%d 64bit=%d\n", proc->getLatencySamples (), proc->getTailSamples (),
+			       proc->canProcessSampleSize (kSample32) == kResultTrue, proc->canProcessSampleSize (kSample64) == kResultTrue);
+		if (ctrl)
+		{
+			printf ("  parameters: %d\n", ctrl->getParameterCount ());
+			for (int p = 0; p < ctrl->getParameterCount (); ++p)
+			{
+				ParameterInfo pi {};
+				ctrl->getParameterInfo (p, pi);
+				printf ("    id=%-6u '%s' units='%s' steps=%d default=%.3f flags=[%s%s%s%s%s]\n", pi.id, s16 (pi.title).c_str (), s16 (pi.units).c_str (),
+				       pi.stepCount, pi.defaultNormalizedValue, (pi.flags & ParameterInfo::kCanAutomate) ? "automate " : "",
+				       (pi.flags & ParameterInfo::kIsBypass) ? "BYPASS " : "", (pi.flags & ParameterInfo::kIsReadOnly) ? "readonly " : "",
+				       (pi.flags & ParameterInfo::kIsHidden) ? "hidden " : "", (pi.flags & ParameterInfo::kIsList) ? "list" : "");
+			}
+		}
+		FUnknown* unk = nullptr;
+		IProcessContextRequirements* req = nullptr;
+		if (proc && proc->queryInterface (IProcessContextRequirements::iid, reinterpret_cast<void**> (&req)) == kResultOk && req)
+			printf ("  process-context requirements flags=0x%x\n", req->getProcessContextRequirements ());
+		(void)unk;
+		if (ctrl)
+		{
+			IPlugView* v = ctrl->createView ("editor");
+			if (v)
+			{
+				ViewRect r {};
+				v->getSize (&r);
+				printf ("  editor: %d x %d, ", r.getWidth (), r.getHeight ());
+				IPlugViewContentScaleSupport* cs = nullptr;
+				printf ("scale-support=%d\n", v->queryInterface (IPlugViewContentScaleSupport::iid, reinterpret_cast<void**> (&cs)) == kResultOk && cs);
+				v->release ();
+			}
+		}
+	}
+	return 0;
+}
+
 int wmain (int argc, wchar_t** argv)
 {
+	if (argc > 2 && std::wstring (argv[2]) == L"inspect")
+		return inspectPlugin (argv[1]);
 	if (argc < 2)
 	{
 		printf ("usage: elnoise_tests <elNoise.vst3 binary>\n");
@@ -831,6 +1038,7 @@ int wmain (int argc, wchar_t** argv)
 	testEditorLifecycle ();
 	testScaling ();
 	testInstancesAndLifecycle ();
+	testMonoEco ();
 
 	printf ("\n==== %d passed, %d failed ====\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;

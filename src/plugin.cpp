@@ -17,6 +17,7 @@
 #include "pluginterfaces/vst/vsttypes.h"
 #include "base/source/fstreamer.h"
 #include "public.sdk/source/common/pluginview.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 
 #define NOMINMAX
@@ -50,7 +51,7 @@ using Microsoft::WRL::ComPtr;
 
 static const FUID kPluginUID (0x5A3C1E70, 0x9B2F4D18, 0xA6C47D02, 0x3E8B5F91);
 
-enum : ParamID { kMethod = 98, kBypass = 99, kSuppression = 100, kVadThreshold = 101, kVadGrace = 102 };
+enum : ParamID { kMethod = 98, kBypass = 99, kSuppression = 100, kVadThreshold = 101, kVadGrace = 102, kMono = 103, kEco = 104 };
 static constexpr double kMinDb = -60.0;
 static constexpr double kMaxDb = 0.0;
 static constexpr double kDefaultDb = -30.0; // OBS default
@@ -97,6 +98,7 @@ public:
 	}
 
 	void setEnabled (bool e) { enabled.store (e, std::memory_order_relaxed); }
+	bool isEnabled () const { return enabled.load (std::memory_order_relaxed); }
 
 	void push (float x)
 	{
@@ -183,8 +185,8 @@ class SpeexView : public CPluginView, public IPlugViewContentScaleSupport
 public:
 	SpeexView (EditController* c, std::atomic<double>* db, std::atomic<bool>* bp, std::atomic<int>* mt,
 	           const std::atomic<double>* sr, std::atomic<double>* vt, std::atomic<double>* vg,
-	           const std::atomic<float>* vp, Analyzer* in, Analyzer* out)
-	: CPluginView (nullptr), ctrl (c), dbValue (db), byp (bp), meth (mt), rate (sr), vthr (vt), vgrace (vg), vprob (vp),
+	           const std::atomic<float>* vp, Analyzer* in, Analyzer* out, std::atomic<bool>* mn, std::atomic<bool>* ec)
+	: CPluginView (nullptr), ctrl (c), mono (mn), eco (ec), dbValue (db), byp (bp), meth (mt), rate (sr), vthr (vt), vgrace (vg), vprob (vp),
 	  aIn (in), aOut (out)
 	{
 		rect = ViewRect (0, 0, kW, kH); // logical size; grows with the DPI scale (see applyScale)
@@ -229,8 +231,8 @@ public:
 			return kResultFalse;
 		if (!hostScale) // host did not tell us: use the DPI of the window we live in
 			applyScale (dpiScaleOf (static_cast<HWND> (parent)), true);
-		aIn->setEnabled (true);
-		aOut->setEnabled (true);
+		aIn->setEnabled (!eco->load ());
+		aOut->setEnabled (!eco->load ());
 		running = true;
 		ticker = std::thread ([this] {
 			while (running)
@@ -461,6 +463,62 @@ private:
 		ctrl->setParamNormalized (kBypass, nv);
 		ctrl->performEdit (kBypass, nv);
 		ctrl->endEdit (kBypass);
+		dirty = true;
+	}
+
+	// Options dropdown: sits where the Bypass pill used to be, holds MONO/STEREO, ECO and BYPASS (stays open until a click outside)
+	static constexpr float kOptW = 230.f, kOptRowH = 40.f;
+	void optTrig (float& x, float& y, float& w, float& h) const
+	{
+		if (rnnMode ()) { w = 94.f; h = 26.f; x = kRnBypX + kRnBypW - w; y = kRnBypY; }
+		else { w = 94.f; h = 26.f; x = kBypX + 3.f; y = kBypY; } // same size as in the RNNoise layout
+	}
+	void optPanel (float& x, float& y, float& w, float& h) const
+	{
+		float tx, ty, tw, th;
+		optTrig (tx, ty, tw, th);
+		w = kOptW;
+		h = 12.f + 3 * kOptRowH;
+		x = tx + tw - w;
+		y = rnnMode () ? ty + th + 6.f : ty - 6.f - h; // RNNoise: the trigger is at the top, open downwards; Speex: open upwards
+	}
+	bool hitOptTrig (int x, int y) const
+	{
+		float tx, ty, tw, th;
+		optTrig (tx, ty, tw, th);
+		return tab == 0 && x >= tx && x <= tx + tw && y >= ty && y <= ty + th;
+	}
+	// -1 = outside the panel, 0..2 = row
+	int hitOptRow (int x, int y) const
+	{
+		float px, py, pw, ph;
+		optPanel (px, py, pw, ph);
+		if (x < px || x > px + pw || y < py || y > py + ph)
+			return -1;
+		const int r = static_cast<int> ((y - py - 6.f) / kOptRowH);
+		return (y - py >= 6.f && r >= 0 && r < 3) ? r : -1;
+	}
+	bool inOptPanel (int x, int y) const
+	{
+		float px, py, pw, ph;
+		optPanel (px, py, pw, ph);
+		return x >= px && x <= px + pw && y >= py && y <= py + ph;
+	}
+	bool optPressed (int i) const { return i == 0 ? !mono->load () : i == 1 ? eco->load () : byp->load (); } // MONO row: pressed = STEREO
+	void toggleOpt (int i)
+	{
+		if (i == 2)
+		{
+			toggleBypass ();
+			return;
+		}
+		std::atomic<bool>* f = i == 0 ? mono : eco;
+		const ParamID pid = i == 0 ? kMono : kEco;
+		const double nv = f->load () ? 0.0 : 1.0;
+		ctrl->beginEdit (pid);
+		ctrl->setParamNormalized (pid, nv);
+		ctrl->performEdit (pid, nv);
+		ctrl->endEdit (pid);
 		dirty = true;
 	}
 
@@ -1099,20 +1157,22 @@ private:
 	void drawSliderDynamic ()
 	{
 		const bool rn = rnnMode ();
-		// bypass pill (top right of the display in RNNoise mode, next to the value box in Speex mode)
 		{
 			float px, py, pw, ph;
-			bypassRect (px, py, pw, ph);
-			const bool on = byp->load ();
+			optTrig (px, py, pw, ph);
+			const bool on = byp->load (); // lit while bypassed
 			if (on)
 				rt->FillRoundedRectangle (RR (px, py, pw, ph, ph / 2), vgrad (gPill, py, py + ph));
 			else
-				fillRR (px, py, pw, ph, ph / 2, C (22, 22, 24));
+				fillRR (px, py, pw, ph, ph / 2, optOpen ? C (40, 40, 44) : C (22, 22, 24));
 			strokeRR (px + 0.5f, py + 0.5f, pw - 1, ph - 1, ph / 2 - 0.5f, on ? C (255, 255, 255, 90) : C (84, 84, 90, 170));
-			solid->SetColor (on ? C (24, 24, 26) : C (96, 96, 102));
-			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (px + (rn ? 17.f : 15.f), py + ph / 2), rn ? 3.7f : 3.5f, rn ? 3.7f : 3.5f), solid.Get ());
-			text (L"BYPASS", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, on ? C (24, 24, 26) : cMuted, px + 58.f,
-			      py + (rn ? 7.2f : 6.5f), kCenter, 1.5f);
+			const Clr fg = on ? C (24, 24, 26) : (optOpen ? cText : cMuted);
+			text (on ? L"BYPASSED" : L"OPTIONS", 10, DWRITE_FONT_WEIGHT_SEMI_BOLD, fg, px + 33.f, py + ph / 2 - 6.5f, kCenter, 1.2f);
+			// chevron
+			const float cx = px + pw - 15.f, cy = py + ph / 2 + (optOpen == rn ? 1.f : -1.f) * 0.f;
+			const float d = optOpen != rn ? 2.2f : -2.2f; // points toward the direction the panel opens/closes
+			line (cx - 3.5f, cy - d * 0.5f, cx, cy + d * 0.5f, fg, 1.4f);
+			line (cx, cy + d * 0.5f, cx + 3.5f, cy - d * 0.5f, fg, 1.4f);
 		}
 
 		drawLcdContent (0);
@@ -1221,6 +1281,38 @@ private:
 	}
 
 	// small wrapped text bubble above (anchorX, anchorY)
+	void drawOptions ()
+	{
+		float px, py, pw, ph;
+		optPanel (px, py, pw, ph);
+		for (int i = 4; i >= 1; --i)
+			fillRR (px - i, py - i + 4, pw + 2 * i, ph + 2 * i, 12 + i, C (0, 0, 0, 30));
+		fillRR (px, py, pw, ph, 12, C (30, 30, 33));
+		strokeRR (px + 0.5f, py + 0.5f, pw - 1, ph - 1, 11.5f, C (96, 96, 102, 200), 1.f);
+		for (int i = 0; i < 3; ++i)
+		{
+			const float y = py + 6 + i * kOptRowH;
+			const bool pr = optPressed (i);
+			if (hoverTog == i)
+				fillRR (px + 6, y + 2, pw - 12, kOptRowH - 4, 8, C (255, 255, 255, 22));
+			const wchar_t* title = i == 0 ? (pr ? L"STEREO" : L"MONO") : i == 1 ? L"ECO" : L"BYPASS";
+			const wchar_t* sub = i == 0 ? (pr ? L"Left and right kept apart" : L"One channel, half the CPU")
+			                     : i == 1 ? L"Spectrum paused, less redraw"
+			                              : L"Original mic, unprocessed";
+			text (title, 12, DWRITE_FONT_WEIGHT_SEMI_BOLD, cWhite, px + 18, y + 6, kLeft, 1.2f);
+			text (sub, 10, DWRITE_FONT_WEIGHT_NORMAL, cMuted, px + 18, y + 23, kLeft);
+			// switch: pressed = lit
+			const float sw = 34.f, sh = 18.f, sx = px + pw - 18 - sw, sy = y + (kOptRowH - sh) / 2;
+			if (pr)
+				rt->FillRoundedRectangle (RR (sx, sy, sw, sh, sh / 2), vgrad (gPill, sy, sy + sh));
+			else
+				fillRR (sx, sy, sw, sh, sh / 2, C (22, 22, 24));
+			strokeRR (sx + 0.5f, sy + 0.5f, sw - 1, sh - 1, sh / 2 - 0.5f, pr ? C (255, 255, 255, 90) : C (84, 84, 90, 170));
+			solid->SetColor (pr ? C (24, 24, 26) : C (110, 110, 116));
+			rt->FillEllipse (D2D1::Ellipse (D2D1::Point2F (pr ? sx + sw - sh / 2 : sx + sh / 2, sy + sh / 2), sh / 2 - 3.5f, sh / 2 - 3.5f), solid.Get ());
+		}
+	}
+
 	void drawTooltip (const wchar_t* txt, float anchorX, float anchorY)
 	{
 		ComPtr<IDWriteTextFormat> fmt;
@@ -1297,6 +1389,8 @@ private:
 			infoPos (hoverInfo, ix, iy);
 			drawTooltip (infoText (hoverInfo), ix, iy - 14.f);
 		}
+		if (optOpen && tab == 0)
+			drawOptions ();
 		if (menuOpen)
 			drawMenu ();
 		if (rt->EndDraw () == D2DERR_RECREATE_TARGET)
@@ -1347,7 +1441,23 @@ private:
 			return;
 		if (rt && (rt->CheckWindowState () & D2D1_WINDOW_STATE_OCCLUDED))
 			return;
+		const bool ecoOn = eco->load ();
+		if (ecoOn == aIn->isEnabled ()) // follow the Eco switch (also when the host automates it)
+		{
+			aIn->setEnabled (!ecoOn);
+			aOut->setEnabled (!ecoOn);
+			dirty = true;
+		}
 		bool changed = tab == 0 && updateData ();
+		const bool mo = mono->load ();
+		const bool by = byp->load ();
+		if (mo != lastMono || ecoOn != lastEco || by != lastByp)
+		{
+			lastMono = mo;
+			lastEco = ecoOn;
+			lastByp = by;
+			changed = true;
+		}
 		if (editing && ((GetTickCount () - caretT) / 530) != caretPhase)
 		{
 			caretPhase = (GetTickCount () - caretT) / 530;
@@ -1362,7 +1472,7 @@ private:
 			changed = true;
 		}
 		// the analyzer only needs 30 fps; interaction (dirty / dragging) gets the full display rate
-		if (!dirty && !dragging && (++skip & 1))
+		if (!dirty && !dragging && (++skip & (ecoOn ? 3 : 1))) // Eco: 15 fps
 			return;
 		if (dirty || changed)
 		{
@@ -1412,6 +1522,19 @@ private:
 			{
 				if (!self)
 					return 0;
+				if (self->optOpen)
+				{
+					const int r = self->hitOptRow (x, y);
+					if (r >= 0)
+						self->toggleOpt (r); // the list stays open
+					else if (!self->inOptPanel (x, y) || self->hitOptTrig (x, y)) // outside, or the trigger again: close
+					{
+						self->optOpen = false;
+						self->hoverTog = -1;
+						self->dirty = true;
+					}
+					return 0;
+				}
 				if (self->menuOpen)
 				{
 					int row = self->hitMenuRow (x, y);
@@ -1430,6 +1553,7 @@ private:
 					if (self->editing)
 						self->commitEdit ();
 					self->menuOpen = true;
+					self->optOpen = false;
 					self->hoverRow = -1;
 					self->dirty = true;
 					return 0;
@@ -1443,9 +1567,11 @@ private:
 						self->startEdit (lcd);
 					return 0;
 				}
-				if (self->tab == 0 && self->hitBypass (x, y))
+				if (self->hitOptTrig (x, y))
 				{
-					self->toggleBypass ();
+					self->optOpen = true;
+					self->menuOpen = false;
+					self->dirty = true;
 					return 0;
 				}
 				int t = self->hitTab (x, y);
@@ -1453,6 +1579,7 @@ private:
 				{
 					self->tab = t;
 					self->menuOpen = false;
+					self->optOpen = false;
 					self->dirty = true;
 				}
 				else if (self->tab == 0 && (self->onSlider (x, y) || self->onGrace (x, y)))
@@ -1480,6 +1607,17 @@ private:
 					else
 						self->setNorm ((x - l) / w);
 					self->lastX = x;
+				}
+				else if (self->optOpen)
+				{
+					const int r = self->hitOptRow (x, y);
+					if (r != self->hoverTog)
+					{
+						self->hoverTog = r;
+						self->dirty = true;
+					}
+					TRACKMOUSEEVENT te {sizeof (te), TME_LEAVE, h, 0};
+					TrackMouseEvent (&te);
 				}
 				else if (self->menuOpen)
 				{
@@ -1509,8 +1647,9 @@ private:
 				}
 				return 0;
 			case WM_MOUSELEAVE:
-				if (self && (self->hoverSlider || self->hoverInfo >= 0))
+				if (self && (self->hoverSlider || self->hoverInfo >= 0 || self->hoverTog >= 0))
 				{
+					self->hoverTog = -1;
 					self->hoverSlider = false;
 					self->hoverInfo = -1;
 					self->dirty = true;
@@ -1561,7 +1700,7 @@ private:
 				if (self && (self->hitPill (pt.x, pt.y) || (self->menuOpen && (self->hitMenuRow (pt.x, pt.y) == 0 || (self->hitMenuRow (pt.x, pt.y) > 0 && self->rnnoiseOk ())))))
 					hand = true;
 				bool ibeam = self && !self->menuOpen && self->hitLcdIdx (pt.x, pt.y) >= 0;
-				if (self && self->tab == 0 && self->hitBypass (pt.x, pt.y))
+				if (self && (self->optOpen ? self->hitOptRow (pt.x, pt.y) >= 0 : self->hitOptTrig (pt.x, pt.y)))
 					hand = true;
 				SetCursor (LoadCursor (nullptr, ibeam ? IDC_IBEAM : (hand ? IDC_HAND : IDC_ARROW)));
 				return TRUE;
@@ -1600,6 +1739,7 @@ private:
 	}
 
 	EditController* ctrl;
+	std::atomic<bool> *mono, *eco;
 	std::atomic<double>* dbValue;
 	std::atomic<bool>* byp;
 	std::atomic<int>* meth;
@@ -1615,6 +1755,9 @@ private:
 	bool editing = false, editFresh = false, menuOpen = false;
 	int editTarget = 0;
 	int hoverInfo = -1; // which "i" icon the mouse is over
+	bool lastMono = true, lastEco = false;
+	int hoverTog = -1; // options row under the mouse
+	bool optOpen = false, lastByp = false;
 	float scale = 1.f; // physical pixels per logical pixel
 	bool hostScale = false; // the host told us the scale through IPlugViewContentScaleSupport
 	int hoverRow = -1, dragTarget = 0; // 0 = main slider, 1 = grace slider
@@ -1645,14 +1788,92 @@ private:
 	std::map<std::wstring, ComPtr<IDWriteTextLayout>> layouts;
 };
 
+
+//------------------------------------------------------------------------
+// Diagnostics: with -DELNOISE_HOST_TRACE the plugin logs what the host does (setActive, setProcessing, process
+// statistics, parameter changes, editor lifetime) to %TEMP%\\elnoise_host.log. Off in release builds.
+#ifdef ELNOISE_HOST_TRACE
+#include <cstdarg>
+#include <mutex>
+namespace trace
+{
+static std::mutex mtx;
+static FILE* file = nullptr;
+static std::atomic<long long> calls {0}, samples {0}, silent {0}, nonPlaying {0}, ctxMissing {0};
+static std::atomic<int> maxBlock {0}, lastCtxState {-1}, lastInputs {-1}, lastOutputs {-1};
+static std::atomic<bool> running {false};
+static std::thread worker;
+static std::atomic<int> refs {0};
+
+static void log (const char* fmt, ...)
+{
+	std::lock_guard<std::mutex> lk (mtx);
+	if (!file)
+	{
+		char path[MAX_PATH];
+		GetTempPathA (MAX_PATH, path);
+		strcat_s (path, "elnoise_host.log");
+		fopen_s (&file, path, "a");
+		if (!file)
+			return;
+	}
+	SYSTEMTIME t;
+	GetLocalTime (&t);
+	fprintf (file, "%02d:%02d:%02d.%03d [t%lu] ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, GetCurrentThreadId ());
+	va_list ap;
+	va_start (ap, fmt);
+	vfprintf (file, fmt, ap);
+	va_end (ap);
+	fputc ('\n', file);
+	fflush (file);
+}
+
+static void start ()
+{
+	if (refs++ == 0)
+	{
+		running = true;
+		worker = std::thread ([] {
+			long long lc = 0, ls = 0, lsil = 0;
+			while (running)
+			{
+				Sleep (500);
+				long long c = calls.load (), sm = samples.load (), si = silent.load ();
+				if (c != lc)
+					log ("process: %lld calls (+%lld), %lld samples, maxBlock=%d, silentInput=%lld, ctxState=0x%x, ctxNull=%lld, inputs=%d outputs=%d",
+					     c, c - lc, sm - ls, maxBlock.load (), si - lsil, lastCtxState.load (), ctxMissing.load (), lastInputs.load (), lastOutputs.load ());
+				else if (lc != -1)
+					log ("process: no calls in the last 500 ms");
+				lc = c; ls = sm; lsil = si;
+			}
+		});
+	}
+}
+static void stop ()
+{
+	if (--refs == 0)
+	{
+		running = false;
+		if (worker.joinable ())
+			worker.join ();
+	}
+}
+} // namespace trace
+#define ETRACE(...) trace::log (__VA_ARGS__)
+#else
+#define ETRACE(...) ((void) 0)
+#endif
+
 //------------------------------------------------------------------------
 class SpeexNoiseSuppression : public SingleComponentEffect
 {
 public:
 	IPlugView* PLUGIN_API createView (FIDString name) SMTG_OVERRIDE
 	{
+		ETRACE ("createView");
 		if (FIDStringsEqual (name, ViewType::kEditor))
-			return new SpeexView (this, &suppressDb, &bypassed, &method, &sampleRate, &vadThr, &vadGrace, &vadProb, &inAnalyzer, &outAnalyzer);
+			return new SpeexView (this, &suppressDb, &bypassed, &method, &sampleRate, &vadThr, &vadGrace, &vadProb, &inAnalyzer, &outAnalyzer,
+			                      &monoMode, &ecoMode);
 		return nullptr;
 	}
 
@@ -1660,6 +1881,10 @@ public:
 
 	tresult PLUGIN_API initialize (FUnknown* ctx) SMTG_OVERRIDE
 	{
+#ifdef ELNOISE_HOST_TRACE
+		trace::start ();
+#endif
+		ETRACE ("initialize");
 		tresult r = SingleComponentEffect::initialize (ctx);
 		if (r != kResultOk)
 			return r;
@@ -1670,7 +1895,7 @@ public:
 		p->setPrecision (0);
 		parameters.addParameter (p);
 		parameters.addParameter (new Parameter (STR16 ("Bypass"), kBypass, nullptr, 0., 1,
-		                                        ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass));
+		                                        ParameterInfo::kCanAutomate)); // deliberately not kIsBypass: see README ("disabled in the host")
 		auto* m = new StringListParameter (STR16 ("Method"), kMethod);
 		m->appendString (STR16 ("Speex"));
 		m->appendString (STR16 ("RNNoise"));
@@ -1679,6 +1904,8 @@ public:
 		auto* vt = new RangeParameter (STR16 ("VAD Threshold"), kVadThreshold, STR16 ("%"), 0., 100., 0., 0, ParameterInfo::kCanAutomate);
 		vt->setPrecision (0);
 		parameters.addParameter (vt);
+		parameters.addParameter (new Parameter (STR16 ("Mono"), kMono, nullptr, 1., 1, ParameterInfo::kCanAutomate));
+		parameters.addParameter (new Parameter (STR16 ("Eco Mode"), kEco, nullptr, 0., 1, ParameterInfo::kCanAutomate));
 		auto* vg = new RangeParameter (STR16 ("VAD Grace Period"), kVadGrace, STR16 ("ms"), 0., 500., 200., 0, ParameterInfo::kCanAutomate);
 		vg->setPrecision (0);
 		parameters.addParameter (vg);
@@ -1687,13 +1914,24 @@ public:
 
 	tresult PLUGIN_API terminate () SMTG_OVERRIDE
 	{
+		ETRACE ("terminate");
+#ifdef ELNOISE_HOST_TRACE
+		trace::stop ();
+#endif
 		destroyStates ();
 		return SingleComponentEffect::terminate ();
+	}
+
+	tresult PLUGIN_API setProcessing (TBool state) SMTG_OVERRIDE
+	{
+		ETRACE ("setProcessing(%d)", int (state));
+		return SingleComponentEffect::setProcessing (state);
 	}
 
 	tresult PLUGIN_API setBusArrangements (SpeakerArrangement* in, int32 numIns, SpeakerArrangement* out,
 	                                       int32 numOuts) SMTG_OVERRIDE
 	{
+		ETRACE ("setBusArrangements(%d in, %d out)", int (numIns), int (numOuts));
 		if (numIns != 1 || numOuts != 1 || in[0] != out[0])
 			return kResultFalse;
 		if (in[0] != SpeakerArr::kMono && in[0] != SpeakerArr::kStereo)
@@ -1713,6 +1951,7 @@ public:
 
 	tresult PLUGIN_API setupProcessing (ProcessSetup& setup) SMTG_OVERRIDE
 	{
+		ETRACE ("setupProcessing(sr=%.0f, maxBlock=%d, mode=%d)", setup.sampleRate, int (setup.maxSamplesPerBlock), int (setup.processMode));
 		sampleRate = setup.sampleRate;
 		inAnalyzer.setRate (sampleRate);
 		outAnalyzer.setRate (sampleRate);
@@ -1723,6 +1962,7 @@ public:
 
 	tresult PLUGIN_API setActive (TBool state) SMTG_OVERRIDE
 	{
+		ETRACE ("setActive(%d)", int (state));
 		if (state)
 			createStates (2);
 		else
@@ -1732,6 +1972,22 @@ public:
 
 	tresult PLUGIN_API process (ProcessData& data) SMTG_OVERRIDE
 	{
+#ifdef ELNOISE_HOST_TRACE
+		trace::calls++;
+		trace::samples += data.numSamples;
+		if (data.numSamples > trace::maxBlock.load ())
+			trace::maxBlock = data.numSamples;
+		trace::lastInputs = data.numInputs;
+		trace::lastOutputs = data.numOutputs;
+		if (data.numInputs > 0 && data.inputs[0].silenceFlags)
+			trace::silent++;
+		if (data.processContext)
+			trace::lastCtxState = static_cast<int> (data.processContext->state);
+		else
+			trace::ctxMissing++;
+		if (data.inputParameterChanges && data.inputParameterChanges->getParameterCount () > 0)
+			ETRACE ("process(): %d parameter change queue(s) in this block", int (data.inputParameterChanges->getParameterCount ()));
+#endif
 		if (data.inputParameterChanges)
 		{
 			int32 n = data.inputParameterChanges->getParameterCount ();
@@ -1748,7 +2004,8 @@ public:
 						setNormalized (v);
 				}
 				else if (q->getParameterId () == kBypass || q->getParameterId () == kMethod ||
-				         q->getParameterId () == kVadThreshold || q->getParameterId () == kVadGrace)
+				         q->getParameterId () == kVadThreshold || q->getParameterId () == kVadGrace ||
+				         q->getParameterId () == kMono || q->getParameterId () == kEco)
 				{
 					if (q->getPoint (q->getPointCount () - 1, off, v) == kResultTrue)
 						setParamNormalized (q->getParameterId (), v);
@@ -1768,6 +2025,30 @@ public:
 		const float bypassTarget = bypassed.load () ? 1.f : 0.f;
 		int level = static_cast<int> (std::lround (suppressDb.load ()));
 		const int meth = method.load ();
+		// MONO: channel 0 processes the mix of L and R, channel 1 only tracks its input and gets a copy of the result
+		const bool mono = monoMode.load () && chans == 2;
+		if (mono != monoPrev)
+		{
+			monoPrev = mono;
+			if (!mono && states.size () > 1) // channel 1 starts again from the dry path until its engine is warm
+			{
+				Chan& c1 = states[1];
+				c1.gb = 1.f;
+				c1.warm = 2 * frame;
+				c1.cold = false;
+			}
+		}
+		if (mono)
+		{
+			if (monoBuf.size () < static_cast<size_t> (data.numSamples))
+				monoBuf.resize (static_cast<size_t> (data.numSamples));
+			const float *l = in.channelBuffers32[0], *r = in.channelBuffers32[1];
+			for (int32 i = 0; i < data.numSamples; ++i)
+			{
+				const float a = std::isfinite (l[i]) ? l[i] : 0.f, b = std::isfinite (r[i]) ? r[i] : 0.f;
+				monoBuf[static_cast<size_t> (i)] = 0.5f * (a + b);
+			}
+		}
 		const bool useRn = meth >= 1 && frame == 480 && std::fabs (sampleRate.load ()- 48000.0) < 1.0;
 		const float vadThrNow = static_cast<float> (vadThr.load ()) / 100.f;
 		const int graceFrames = static_cast<int> (std::ceil (vadGrace.load () / 10.0));
@@ -1781,6 +2062,31 @@ public:
 			}
 			const float* src = in.channelBuffers32[c];
 			float* dst = out.channelBuffers32[c];
+			if (mono && c == 1)
+			{
+				// no engine for this channel: copy the result, keep its delay line / input current for leaving MONO
+				std::memcpy (dst, out.channelBuffers32[0], sizeof (float) * static_cast<size_t> (data.numSamples));
+				for (int32 i = 0; i < data.numSamples; ++i)
+				{
+					float x = std::isfinite (src[i]) ? std::clamp (src[i], -1.f, 1.f) : 0.f;
+					ch.inQ[ch.fill] = static_cast<spx_int16_t> (x * 32767.f);
+					ch.inF[ch.fill] = x * 32768.f;
+					ch.dry[ch.fill] = x;
+					if (++ch.fill == frame)
+					{
+						ch.fill = 0;
+						std::fill (ch.outQ.begin (), ch.outQ.end (), static_cast<spx_int16_t> (0));
+						std::fill (ch.outF.begin (), ch.outF.end (), 0.f);
+						ch.gate = ch.gateTarget = 1.f;
+						ch.hold = 0;
+					}
+				}
+				ch.gb = 1.f;
+				ch.warm = 2 * frame;
+				continue;
+			}
+			if (mono && c == 0)
+				src = monoBuf.data ();
 			// Fully bypassed (button, or the host switching the effect off): the output is just the 10 ms delayed
 			// input. Skip the engines and the analyzers completely: no CPU is spent, and the spectrum freezes
 			// instead of dancing, like on a switched-off plugin.
@@ -1902,6 +2208,10 @@ public:
 			setParamNormalized (kVadThreshold, std::clamp (d, 0.0, 100.0) / 100.0);
 		if (r.readDouble (d))
 			setParamNormalized (kVadGrace, std::clamp (d, 0.0, 500.0) / 500.0);
+		if (r.readInt32 (b))
+			setParamNormalized (kMono, b ? 1.0 : 0.0);
+		if (r.readInt32 (b))
+			setParamNormalized (kEco, b ? 1.0 : 0.0);
 		return kResultOk;
 	}
 
@@ -1913,11 +2223,14 @@ public:
 		w.writeInt32 (method.load ());
 		w.writeDouble (vadThr.load ());
 		w.writeDouble (vadGrace.load ());
+		w.writeInt32 (monoMode.load () ? 1 : 0);
+		w.writeInt32 (ecoMode.load () ? 1 : 0);
 		return kResultOk;
 	}
 
 	tresult PLUGIN_API setParamNormalized (ParamID id, ParamValue v) SMTG_OVERRIDE
 	{
+		ETRACE ("param %u = %.4f", unsigned (id), v);
 		if (id == kSuppression)
 			suppressDb = kMinDb + v * (kMaxDb - kMinDb);
 		else if (id == kBypass)
@@ -1928,6 +2241,10 @@ public:
 			vadThr = v * 100.0;
 		else if (id == kVadGrace)
 			vadGrace = v * 500.0;
+		else if (id == kMono)
+			monoMode = v > 0.5;
+		else if (id == kEco)
+			ecoMode = v > 0.5;
 		return SingleComponentEffect::setParamNormalized (id, v);
 	}
 
@@ -1996,6 +2313,9 @@ private:
 	std::vector<Chan> states;
 	std::atomic<double> suppressDb {kDefaultDb};
 	std::atomic<bool> bypassed {false};
+	std::atomic<bool> monoMode {true}, ecoMode {false};
+	bool monoPrev = true;
+	std::vector<float> monoBuf;
 	std::atomic<int> method {0};
 	std::atomic<double> vadThr {0.0}, vadGrace {200.0};
 	std::atomic<float> vadProb {0.f};

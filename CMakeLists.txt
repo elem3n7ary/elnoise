@@ -63,6 +63,10 @@ smtg_add_vst3plugin(elNoise
     external/vst3sdk/public.sdk/source/vst/vstsinglecomponenteffect.cpp)
 target_link_libraries(elNoise PRIVATE sdk speexdsp_pp rnnoise_lib)
 target_compile_features(elNoise PRIVATE cxx_std_17)
+option(ELNOISE_HOST_TRACE "Log host calls to %TEMP%/elnoise_host.log (diagnostics)" OFF)
+if(ELNOISE_HOST_TRACE)
+    target_compile_definitions(elNoise PRIVATE ELNOISE_HOST_TRACE=1)
+endif()
 
 # --- host-side test suite (loads the built plugin like a DAW would)
 add_executable(elnoise_tests EXCLUDE_FROM_ALL tests/elnoise_tests.cpp external/vst3sdk/public.sdk/source/common/memorystream.cpp)

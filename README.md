@@ -1,15 +1,15 @@
-# elNoise: microphone noise suppression (VST3)
+# elNoise: AI microphone noise suppression (VST3 for Windows)
 
-**Clean microphone audio for Windows in one plugin: Speex, RNNoise and RNNoise Lite.**
-Works in Elgato **Wave Link**, OBS (via VST hosts) and any other VST3 host. Lightweight, built to run fine on weak PCs.
+**Remove keyboard, fan and background noise from your mic in real time. RNNoise (neural network) and Speex in one
+lightweight VST3 plugin for Elgato Wave Link, OBS, Discord and any other VST3 host.**
 
 ![elNoise](docs/screenshot.png)
 
 ## Why
 
 OBS has built-in noise suppression (Speex and RNNoise), but only inside OBS. elNoise puts the same engines, plus the
-newest RNNoise models, into a VST3 you can use anywhere, for example as a microphone effect in Wave Link, so you get
-the same clean mic in calls, Discord and games.
+newest RNNoise v0.2 models, into a VST3 you can use anywhere, for example as a microphone effect in **Elgato Wave Link**,
+so you get the same clean mic in calls, Discord, streams and games. It is free, open source and small enough for weak PCs.
 
 ## Engines
 
@@ -23,7 +23,7 @@ Pick the engine with the **METHOD** selector at the top.
 
 RNNoise needs a **48 kHz** session (like most RNNoise plugins). Speex works at any sample rate.
 
-![RNNoise mode](docs/screenshot-rnnoise.png)
+![RNNoise mode with the options list](docs/screenshot-rnnoise.png)
 
 ## Features
 
@@ -31,11 +31,16 @@ RNNoise needs a **48 kHz** session (like most RNNoise plugins). Speex works at a
 - **RNNoise / RNNoise Lite:** **Voice Gate**: the neural network's voice-activity score drives an optional gate
   (**threshold**, 0 = off, and **grace period** so word endings are not cut). A live meter shows how sure the model is
   that it hears a voice
-- **Bypass** button (crossfaded, latency stays constant, also exposed to the host)
+- **OPTIONS** list (stays open until you click outside):
+  - **MONO / STEREO**: mono (default) mixes both channels and processes them once, so it needs about half the CPU
+  - **ECO**: pauses the spectrum analyzer and redraws the window less often
+  - **BYPASS**: crossfaded, latency stays constant
 - Live **spectrum analyzer** with input / output / reduction levels
 - Never outputs digital silence: a barely audible noise floor is added only when the output would otherwise be exactly
   zero, so apps like Discord do not think your mic is dead
-- Mono and stereo, 10 ms latency, GPU-accelerated interface (Direct2D). The analyzer only runs while the window is open
+- Switching the plugin off in the host (Wave Link) really switches it off: no processing, nothing moves
+- 10 ms latency, GPU-accelerated interface (Direct2D), sharp on high-DPI and multi-monitor setups. The analyzer only
+  runs while the window is open
 - Smooth slider with fine adjust (hold **Shift**), mouse wheel, or click the number and **type it in**
 
 ## Install
